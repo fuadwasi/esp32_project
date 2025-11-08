@@ -274,7 +274,12 @@ MQTT_PASSWORD = "orbiqlabsMqtt159"
 
 ### MQTT Topics
 
-**Subscribe to**: `devices/{device_id}/state`
+**Subscribe to**: `devices/{device_id}`
+
+Example: If your device_id is `esp32-default-device`, the topic will be:
+```
+devices/esp32-default-device
+```
 
 The device listens for JSON messages with the following format:
 ```json
@@ -286,13 +291,17 @@ The device listens for JSON messages with the following format:
 
 #### Message Types
 
-1. **Status** - Update relay states
+1. **Status** - Update relay states (supports 1-8 relays)
    ```json
    {
      "t": "Status",
-     "d": "10100110"
+     "d": "1100110"
    }
    ```
+   - The data string represents relay states: `1` = ON, `0` = OFF
+   - Can be 1-8 characters long (e.g., "1100110" for 7 relays)
+   - Relays not specified will be set to OFF
+   - Example: `"1100110"` sets Relay 1=ON, 2=ON, 3=OFF, 4=OFF, 5=ON, 6=ON, 7=OFF, 8=OFF
 
 2. **Message** - Display custom message on LCD
    ```json
