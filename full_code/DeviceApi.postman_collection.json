@@ -1,0 +1,192 @@
+{
+  "info": {
+    "name": "IoT Device API",
+    "description": "Collection covering the Device API endpoints exposed by the IoT Manager plugin.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_postman_id": "5c839e0c-0000-4000-8000-000000000001"
+  },
+  "item": [
+    {
+      "name": "Push Sensor Reading",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-ESP32-Device-Id",
+            "value": "{{deviceId}}",
+            "description": "Unique identifier for the ESP32 device calling the API."
+          },
+          {
+            "key": "X-IOT-Token",
+            "value": "{{iotToken}}",
+            "description": "JWT or plain token issued for the device, depending on the configured security mode."
+          },
+          {
+            "key": "X-IOT-Signature",
+            "value": "{{iotSignature}}",
+            "description": "Hex encoded HMAC SHA256 signature computed from the token using the device secret when HMAC mode is enabled.",
+            "disabled": true
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"sensorIdentifier\": \"temp-01\",\n  \"numericValue\": 24.7,\n  \"textValue\": \"24.7 °C\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api-iot/device/sensor-readings",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api-iot",
+            "device",
+            "sensor-readings"
+          ]
+        },
+        "description": "Pushes a numeric or textual reading for a sensor that belongs to the calling device."
+      },
+      "response": []
+    },
+    {
+      "name": "Get Device Status",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "X-ESP32-Device-Id",
+            "value": "{{deviceId}}",
+            "description": "Unique identifier for the ESP32 device calling the API."
+          },
+          {
+            "key": "X-IOT-Token",
+            "value": "{{iotToken}}",
+            "description": "JWT or plain token issued for the device, depending on the configured security mode."
+          },
+          {
+            "key": "X-IOT-Signature",
+            "value": "{{iotSignature}}",
+            "description": "Hex encoded HMAC SHA256 signature computed from the token using the device secret when HMAC mode is enabled.",
+            "disabled": true
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api-iot/device/status",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api-iot",
+            "device",
+            "status"
+          ]
+        },
+        "description": "Retrieves the formatted status string, online flag and last heartbeat timestamp for the calling device."
+      },
+      "response": []
+    },
+    {
+      "name": "Submit Device Status",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-ESP32-Device-Id",
+            "value": "{{deviceId}}",
+            "description": "Unique identifier for the ESP32 device calling the API."
+          },
+          {
+            "key": "X-IOT-Token",
+            "value": "{{iotToken}}",
+            "description": "JWT or plain token issued for the device, depending on the configured security mode."
+          },
+          {
+            "key": "X-IOT-Signature",
+            "value": "{{iotSignature}}",
+            "description": "Hex encoded HMAC SHA256 signature computed from the token using the device secret when HMAC mode is enabled.",
+            "disabled": true
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"status\": \"1010\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api-iot/device/status",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api-iot",
+            "device",
+            "status"
+          ]
+        },
+        "description": "Submits the current status string for the device channels. Only manual channels are updated when their state changes."
+      },
+      "response": []
+    },
+    {
+      "name": "Ping Device",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "X-ESP32-Device-Id",
+            "value": "{{deviceId}}",
+            "description": "Unique identifier for the ESP32 device calling the API."
+          },
+          {
+            "key": "X-IOT-Token",
+            "value": "{{iotToken}}",
+            "description": "JWT or plain token issued for the device, depending on the configured security mode."
+          },
+          {
+            "key": "X-IOT-Signature",
+            "value": "{{iotSignature}}",
+            "description": "Hex encoded HMAC SHA256 signature computed from the token using the device secret when HMAC mode is enabled.",
+            "disabled": true
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api-iot/device/ping",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api-iot",
+            "device",
+            "ping"
+          ]
+        },
+        "description": "Updates the heartbeat timestamp for the calling device and returns the resulting status."
+      },
+      "response": []
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "https://iot.orbiqlabs.com"
+    },
+    {
+      "key": "iotToken",
+      "value": "REPLACE_WITH_DEVICE_TOKEN"
+    },
+    {
+      "key": "iotSignature",
+      "value": "REPLACE_WITH_HMAC_SIGNATURE"
+    },
+    {
+      "key": "deviceId",
+      "value": "REPLACE_WITH_DEVICE_ID"
+    }
+  ]
+}
