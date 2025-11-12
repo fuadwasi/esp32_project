@@ -90,7 +90,11 @@ const int BTN_CFG = 17;
 const int BTN_TOGGLE = 18;
 
 // Relay pins (change to match your wiring)
-const int relayPins[8] = {13, 12, 14, 27, 26, 25, 33, 32};
+const int relayPins[8] = {12, 13, 14, 27, 26, 25, 33, 32};
+
+// Relay module type: true = Active LOW (most common), false = Active HIGH
+// Active LOW means: LOW = relay ON, HIGH = relay OFF
+const bool RELAY_ACTIVE_LOW = true;
 
 // Sensor intervals (ms)
 unsigned long sensorInterval = 30UL * 1000UL; // default 30s; configurable
@@ -225,6 +229,17 @@ String getSessionCookie() {
 }
 
 // ---------- Helpers ----------
+
+// Helper function to set relay state correctly based on hardware type
+void setRelayState(int relayIndex, int state) {
+  if (RELAY_ACTIVE_LOW) {
+    // Active LOW relay: 1 (ON) = LOW, 0 (OFF) = HIGH
+    digitalWrite(relayPins[relayIndex], state ? LOW : HIGH);
+  } else {
+    // Active HIGH relay: 1 (ON) = HIGH, 0 (OFF) = LOW
+    digitalWrite(relayPins[relayIndex], state ? HIGH : LOW);
+  }
+}
 
 // Base64 URL encoding (without padding)
 String base64UrlEncode(const uint8_t* input, size_t length) {
@@ -516,7 +531,7 @@ void setRelaysFromBackendJSON(const String &json) {
         }
         int v = (c == '1') ? 1 : 0;
         relayState[i-1] = v;
-        digitalWrite(relayPins[i-1], v ? HIGH : LOW);
+        setRelayState(i-1, v);
       }
     }
   }
@@ -586,14 +601,14 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       for (int i = 0; i < numRelays; i++) {
         int val = (msgData[i] == '1') ? 1 : 0;
         relayState[i] = val;
-        digitalWrite(relayPins[i], val ? HIGH : LOW);
+        setRelayState(i, val);
         Serial.println("   Relay " + String(i + 1) + " → " + String(val ? "ON" : "OFF"));
       }
       
       // Set remaining relays to OFF if status string is shorter than 8
       for (int i = numRelays; i < 8; i++) {
         relayState[i] = 0;
-        digitalWrite(relayPins[i], LOW);
+        setRelayState(i, 0);
         Serial.println("   Relay " + String(i + 1) + " → OFF (not in status)");
       }
       
@@ -775,14 +790,14 @@ bool fetchRelayStateFromBackend() {
       for (int i = 0; i < numRelays; i++) {
         int val = (status[i] == '1') ? 1 : 0;
         relayState[i] = val;
-        digitalWrite(relayPins[i], val ? HIGH : LOW);
+        setRelayState(i, val);
         Serial.println("  Relay " + String(i + 1) + " set to: " + String(val) + " (" + String(val ? "ON" : "OFF") + ")");
       }
       
       // Set remaining relays to OFF if status string is shorter than 8
       for (int i = numRelays; i < 8; i++) {
         relayState[i] = 0;
-        digitalWrite(relayPins[i], LOW);
+        setRelayState(i, 0);
         Serial.println("  Relay " + String(i + 1) + " set to: 0 (OFF) - not in status string");
       }
       
@@ -1147,7 +1162,7 @@ void handleRelaysSet() {
     String key = "r" + String(i+1);
     bool checked = server.hasArg(key);
     relayState[i] = checked ? 1 : 0;
-    digitalWrite(relayPins[i], relayState[i] ? HIGH : LOW);
+    setRelayState(i, relayState[i]);
     Serial.println("Relay " + String(i+1) + " set to: " + String(relayState[i]));
   }
   
@@ -1280,7 +1295,7 @@ void setup() {
 
   for (int i=0;i<8;i++) {
     pinMode(relayPins[i], OUTPUT);
-    digitalWrite(relayPins[i], LOW);
+    setRelayState(i, 0); // Initialize all relays to OFF
   }
 
   // Start peripherals
@@ -1510,7 +1525,7 @@ void handleButtons() {
         focusIdx = 0;
       }
       relayState[focusIdx] = relayState[focusIdx] ? 0 : 1;
-      digitalWrite(relayPins[focusIdx], relayState[focusIdx] ? HIGH : LOW);
+      setRelayState(focusIdx, relayState[focusIdx]);
       // Update backend with new relay state
       postRelayUpdateToBackend(focusIdx, relayState[focusIdx]);
       Serial.println("Relay " + String(focusIdx) + " toggled locally to " + String(relayState[focusIdx]));
