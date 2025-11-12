@@ -7,7 +7,7 @@
   },
   "item": [
     {
-      "name": "Push Sensor Reading",
+      "name": "Push Sensor Readings",
       "request": {
         "method": "POST",
         "header": [
@@ -34,7 +34,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"sensorIdentifier\": \"temp-01\",\n  \"numericValue\": 24.7,\n  \"textValue\": \"24.7 °C\"\n}"
+          "raw": "[\n  {\n    \"sensorIdentifier\": \"temp-01\",\n    \"numericValue\": 24.7,\n    \"textValue\": \"24.7 \u00b0C\",\n    \"capturedOnUtc\": \"2024-04-01T10:15:30Z\"\n  },\n  {\n    \"sensorIdentifier\": \"humid-01\",\n    \"numericValue\": 56.2,\n    \"textValue\": \"56% RH\"\n  }\n]"
         },
         "url": {
           "raw": "{{baseUrl}}/api-iot/device/sensor-readings",
@@ -47,7 +47,7 @@
             "sensor-readings"
           ]
         },
-        "description": "Pushes a numeric or textual reading for a sensor that belongs to the calling device."
+        "description": "Pushes one or more numeric or textual readings for sensors that belong to the calling device."
       },
       "response": []
     },

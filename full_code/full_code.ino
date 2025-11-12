@@ -77,6 +77,10 @@
 #include <time.h>
 
 // ---------- CONFIG ----------
+// Sensor Identifiers (unique for each sensor type)
+#define SENSOR_DHT11_TEMP "dht11-temperature"
+#define SENSOR_DHT11_HUMIDITY "dht11-humidity"
+#define SENSOR_DS18B20_TEMP "ds18b20-temperature"
 #define BACKEND_BASE_URL "https://iot.orbiqlabs.com" // IoT Device API base URL
 #define SENSOR_POST_ENDPOINT "/api-iot/device/sensor-readings"
 #define GET_STATUS_ENDPOINT "/api-iot/device/status"
@@ -113,7 +117,7 @@ const int relayPins[8] = {12, 13, 14, 27, 26, 25, 33, 32};
 const bool RELAY_ACTIVE_LOW = true;
 
 // Sensor intervals (ms)
-unsigned long sensorInterval = 30UL * 1000UL; // default 30s; configurable
+unsigned long sensorInterval = 60UL * 1000UL; // default 1 minute; configurable
 unsigned long lastSensorMillis = 0;
 
 // WiFi and MQTT connection state tracking
@@ -393,53 +397,6 @@ void checkAndResetWifiSettings() {
 }
 
 // ---------- IoT Device API Functions ----------
-
-bool postSensorReading(const String &sensorId, float numericValue, const String &textValue) {
-  HTTPClient http;
-  String url = String(BACKEND_BASE_URL) + SENSOR_POST_ENDPOINT;
-  
-  Serial.println("Posting sensor reading to: " + url);
-  Serial.println("Device ID: " + device_id);
-  
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-ESP32-Device-Id", device_id);
-  
-  String jwt = getValidJWT();
-  http.addHeader("X-IOT-Token", jwt);
-  Serial.println("JWT Token: " + jwt.substring(0, 20) + "...");
-  
-  StaticJsonDocument<256> doc;
-  doc["sensorIdentifier"] = sensorId;
-  doc["numericValue"] = numericValue;
-  doc["textValue"] = textValue;
-  
-  String payload;
-  serializeJson(doc, payload);
-  
-  Serial.println("Request payload: " + payload);
-  
-  int code = http.POST(payload);
-  if (code > 0) {
-    String resp = http.getString();
-    Serial.printf("Sensor POST response (%d): %s\n", code, resp.c_str());
-    http.end();
-    
-    if (code == 404) {
-      Serial.println("⚠️ 404 Error - Device may not be registered in backend or wrong endpoint");
-      Serial.println("Please verify:");
-      Serial.println("1. Device ID '" + device_id + "' is registered in the backend");
-      Serial.println("2. JWT secret matches the backend configuration");
-      Serial.println("3. API endpoint is correct: " + url);
-    }
-    
-    return (code >= 200 && code < 300);
-  } else {
-    Serial.printf("Sensor POST failed, error: %s\n", http.errorToString(code).c_str());
-    http.end();
-    return false;
-  }
-}
 
 bool getDeviceStatus(String &statusOut, bool &onlineOut) {
   HTTPClient http;
@@ -773,21 +730,68 @@ bool ensureJWT() {
 bool postSensorReadings(const std::vector<SensorReading> &readings) {
   if (readings.empty()) return true;
 
-  // Post each reading individually using the new API
-  bool allSuccess = true;
-  for (const auto &reading : readings) {
-    bool success = postSensorReading(reading.name, reading.value, 
-                                     String(reading.value, 2) + " " + reading.unit);
-    if (!success) {
-      allSuccess = false;
-      Serial.println("Failed to post reading: " + reading.name);
-    } else {
-      Serial.println("Successfully posted: " + reading.name);
-    }
-    delay(100); // Small delay between requests
+  HTTPClient http;
+  String url = String(BACKEND_BASE_URL) + SENSOR_POST_ENDPOINT;
+
+  Serial.println("Posting sensor readings to: " + url);
+  Serial.println("Device ID: " + device_id);
+  Serial.println("Number of readings: " + String(readings.size()));
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-ESP32-Device-Id", device_id);
+
+  String jwt = getValidJWT();
+  http.addHeader("X-IOT-Token", jwt);
+  Serial.println("JWT Token: " + jwt.substring(0, 20) + "...");
+
+  // Create JSON array of sensor readings
+  StaticJsonDocument<2048> doc;
+  JsonArray readingsArray = doc.to<JsonArray>();
+
+  // Get current UTC time for all readings
+  struct tm timeinfo;
+  char timestamp[25]; // ISO 8601 format: "2024-11-13T15:30:00Z"
+  if (getLocalTime(&timeinfo)) {
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+  } else {
+    strcpy(timestamp, "2024-01-01T00:00:00Z"); // fallback
   }
-  
-  return allSuccess;
+
+  // Add each reading to the array
+  for (const auto &reading : readings) {
+    JsonObject readingObj = readingsArray.createNestedObject();
+    readingObj["sensorIdentifier"] = reading.name;
+    readingObj["numericValue"] = reading.value;
+    readingObj["textValue"] = String(reading.value, 2) + " " + reading.unit;
+    readingObj["capturedOnUtc"] = timestamp;
+  }
+
+  String payload;
+  serializeJson(doc, payload);
+
+  Serial.println("Request payload: " + payload);
+
+  int code = http.POST(payload);
+  if (code > 0) {
+    String resp = http.getString();
+    Serial.printf("Sensor POST response (%d): %s\n", code, resp.c_str());
+    http.end();
+
+    if (code == 404) {
+      Serial.println("⚠️ 404 Error - Device may not be registered in backend or wrong endpoint");
+      Serial.println("Please verify:");
+      Serial.println("1. Device ID '" + device_id + "' is registered in the backend");
+      Serial.println("2. JWT secret matches the backend configuration");
+      Serial.println("3. API endpoint is correct: " + url);
+    }
+
+    return (code >= 200 && code < 300);
+  } else {
+    Serial.printf("Sensor POST failed, error: %s\n", http.errorToString(code).c_str());
+    http.end();
+    return false;
+  }
 }
 
 bool fetchRelayStateFromBackend() {
@@ -1370,12 +1374,14 @@ void setup() {
   lcd.print(versionLine);
   delay(3000); // Show for 3 seconds
 
-  // Show WiFi configuration info
-  lcd.clear();
-  lcd.setCursor(0,0);
-  lcd.print("SSID:ESP32_Cfg");
-  lcd.setCursor(0,1);
-  lcd.print("Pass:12345678");
+  // Show WiFi configuration info (only if not already connected)
+  if (WiFi.status() != WL_CONNECTED) {
+    lcd.clear();
+    lcd.setCursor(0,0);
+    lcd.print("SSID:ESP32_Cfg");
+    lcd.setCursor(0,1);
+    lcd.print("Pass:12345678");
+  }
   
   // WiFiManager for setup
   wifiManager.setTimeout(600); // captive portal times out after 10 minutes
@@ -1472,7 +1478,7 @@ void cycleLCD() {
     return; // Don't cycle through normal screens
   }
   
-  if (millis() - lastCycle < 3000) return; // change every 3s
+  if (millis() - lastCycle < 5000) return; // change every 5s
   lastCycle = millis();
 
   if (navMode) {
@@ -1491,7 +1497,7 @@ void cycleLCD() {
   struct tm timeinfo;
   char dateTimeStr[16]; // "12Nov15:30" = 9 chars + null terminator + space for WiFi
   if (getLocalTime(&timeinfo)) {
-    strftime(dateTimeStr, sizeof(dateTimeStr), "%d%b%H:%M", &timeinfo);
+    strftime(dateTimeStr, sizeof(dateTimeStr), "%d%b%y %H:%M", &timeinfo);
   } else {
     strcpy(dateTimeStr, "00XXX00:00");
   }
@@ -1499,7 +1505,7 @@ void cycleLCD() {
   // Get WiFi connection indicator (only show if connected)
   String wifiIndicator = "";
   if (WiFi.status() == WL_CONNECTED) {
-    wifiIndicator = "W"; // Simple WiFi connected symbol
+    wifiIndicator = " W"; // Simple WiFi connected symbol
   }
 
   // Line 1: Always show date/time and WiFi indicator
@@ -1512,17 +1518,18 @@ void cycleLCD() {
   // Line 2: Cycle through single values
   switch (slide) {
     case 0: {
-      // Show temperature
+      // Show temperature in both C and F
       ds18b20.requestTemperatures();
       float t2 = ds18b20.getTempCByIndex(0);
       if (t2 != DEVICE_DISCONNECTED_C) {
-        String tempStr = "Temp: " + String(t2, 1) + "C";
+        float tempF = ds18b20.toFahrenheit(t2);
+        String tempStr = "Temp:" + String(t2, 1) + "C " + String(tempF, 1) + "F";
         if (tempStr.length() > 16) tempStr = tempStr.substring(0, 16);
         lcd.setCursor(0,1);
         lcd.print(tempStr);
       } else {
         lcd.setCursor(0,1);
-        lcd.print("Temp: --.-C");
+        lcd.print("Temp:--.-C --.-F");
       }
       break;
     }
@@ -1688,20 +1695,20 @@ void loop() {
     // Validate readings (DHT can sometimes return NAN)
     std::vector<SensorReading> readings;
     if (!isnan(t)){
-      readings.push_back( {"DHT11_Temperature", t, "°C"} );
+      readings.push_back( {SENSOR_DHT11_TEMP, t, "°C"} );
       Serial.print("DHT11_Temperature: ");
       Serial.print(t);
       Serial.println(" °C");
     } 
     if (!isnan(h)) {  
-      readings.push_back( {"DHT11_Humidity", h, "%"} );
+      readings.push_back( {SENSOR_DHT11_HUMIDITY, h, "%"} );
       Serial.print("DHT11_Humidity: ");
       Serial.print(h);
       Serial.println(" %");
     }
     if (t2 != DEVICE_DISCONNECTED_C)
     {
-      readings.push_back( {"DS18B20_Temperature", t2, "°C"} );
+      readings.push_back( {SENSOR_DS18B20_TEMP, t2, "°C"} );
        
       float tempF = ds18b20.toFahrenheit(t2);
       Serial.print("DS18B20 Temperature: ");
