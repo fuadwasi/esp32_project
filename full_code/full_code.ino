@@ -1,9 +1,24 @@
 /*
   ESP32 IoT System - Single-file sketch
-  Version: 1.0.3
-  Last Updated: 2025-11-09
+  Version: 1.0.5
+  Last Updated: 2025-11-13
   
   Changelog:
+  - v1.0.5 (2025-11-13):
+    * Added NTP time synchronization for accurate LCD time display
+    * Redesigned relay page with iOS/Android-style toggle switches
+    * Implemented instant AJAX relay control (no save button needed)
+    * Updated LCD display format: Line 1 shows time + WiFi signal, Line 2 shows DS18B20 temp + relay status
+    * Removed DHT11 temperature from LCD display
+    * Added IP address display in LCD relay/sensor loop
+    * Enhanced temperature bar gradients with -40°C to 60°C range (Blue→Green→Yellow→Orange→Red)
+    * Added time.h include for NTP functionality
+  - v1.0.4 (2025-11-13):
+    * CRITICAL FIX: Corrected relay logic for Active LOW relay modules
+    * Added RELAY_ACTIVE_LOW configuration constant
+    * Created setRelayState() helper function for proper relay control
+    * Fixed inverted relay states (server "1" now correctly turns relay ON)
+    * Added auto-reload functionality on sensors page (5-second countdown)
   - v1.0.3 (2025-11-09):
     * Improved UI/UX with modern input field styling
     * Added beautiful logout button with icon and hover effects
@@ -36,14 +51,14 @@
   
   Pin assignments (change if needed):
     - I2C SDA = 21, SCL = 22
-    - DHT11_PIN = 19
-    - DS18B20_PIN = 4
+    - DHT11_PIN = 4
+    - DS18B20_PIN = 5
     - LED_WIFI_PIN = 2
-    - Buttons: BTN_WIFI_RESET = 35, BTN_NAV = 0, BTN_CFG = 5, BTN_TOGGLE = 18
-    - Relays: relayPins[8] = {13, 12, 14, 27, 26, 25, 33, 32}
+    - Buttons: BTN_WIFI_RESET = 23, BTN_NAV = 19, BTN_CFG = 17, BTN_TOGGLE = 18
+    - Relays: relayPins[8] = {12, 13, 14, 27, 26, 25, 33, 32}
 */
 
-#define FIRMWARE_VERSION "1.0.3"
+#define FIRMWARE_VERSION "1.0.5"
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -59,6 +74,7 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <LiquidCrystal_I2C.h>
+#include <time.h>
 
 // ---------- CONFIG ----------
 #define BACKEND_BASE_URL "https://iot.orbiqlabs.com" // IoT Device API base URL
@@ -843,6 +859,7 @@ void requireAuth() {
 String htmlTemplate(const String &title, const String &body) {
   String s = "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
   s += "<title>" + title + "</title>";
+  s += "<script src='https://code.jquery.com/jquery-3.7.1.min.js' integrity='sha256-/JqT3SQfawRcv/BIHPThkBvs0OEvtFFmqPF/lYI/Cxo=' crossorigin='anonymous'></script>";
   s += "<style>";
   s += "body{font-family:Arial,sans-serif;margin:20px;background:#f0f0f0;}";
   s += ".container{max-width:800px;margin:0 auto;background:white;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);}";
@@ -1093,9 +1110,11 @@ void handleSensorsPage() {
   b += "<div class='sensor-label'>🌡️ DHT11 Temperature</div>";
   b += "<div class='sensor-value' style='color:#FF6B6B;'>" + String(t, 1) + " °C</div>";
   b += "<div class='bar-graph'>";
-  int tempPercent = constrain(map((int)t, 0, 50, 0, 100), 0, 100);
-  b += "<div class='bar-label'>" + String(tempPercent) + "%</div>";
-  b += "<div class='bar-fill' style='width:" + String(tempPercent) + "%;background:linear-gradient(90deg,#FF6B6B,#FF8E53);'></div>";
+  // Temperature range: -40°C to 60°C (100°C range)
+  float tempPercent = constrain(map(t, -40.0, 60.0, 0.0, 100.0), 0.0, 100.0);
+  b += "<div class='bar-label'>" + String(t, 1) + "°C</div>";
+  // Temperature gradient: Blue (cold) -> Green -> Yellow -> Red (hot)
+  b += "<div class='bar-fill' style='width:" + String(tempPercent, 1) + "%;background:linear-gradient(90deg,#2196F3,#4CAF50,#FFEB3B,#FF9800,#F44336);'></div>";
   b += "</div></div>";
   
   // DHT11 Humidity Card
@@ -1113,9 +1132,11 @@ void handleSensorsPage() {
   b += "<div class='sensor-label'>🌡️ DS18B20 Waterproof Temperature</div>";
   b += "<div class='sensor-value' style='color:#FFA726;'>" + String(t2, 2) + " °C</div>";
   b += "<div class='bar-graph'>";
-  int temp2Percent = constrain(map((int)t2, 0, 50, 0, 100), 0, 100);
-  b += "<div class='bar-label'>" + String(temp2Percent) + "%</div>";
-  b += "<div class='bar-fill' style='width:" + String(temp2Percent) + "%;background:linear-gradient(90deg,#FFA726,#FB8C00);'></div>";
+  // Temperature range: -40°C to 60°C (100°C range)
+  float temp2Percent = constrain(map(t2, -40.0, 60.0, 0.0, 100.0), 0.0, 100.0);
+  b += "<div class='bar-label'>" + String(t2, 1) + "°C</div>";
+  // Temperature gradient: Blue (cold) -> Green -> Yellow -> Red (hot)
+  b += "<div class='bar-fill' style='width:" + String(temp2Percent, 1) + "%;background:linear-gradient(90deg,#2196F3,#4CAF50,#FFEB3B,#FF9800,#F44336);'></div>";
   b += "</div></div>";
   
   b += "<p style='margin-top:20px;'><a href='/'>← Back to Home</a> | <a href='/relays'>View Relays →</a></p>";
@@ -1132,17 +1153,40 @@ void handleRelaysPage() {
   
   Serial.println("Auth passed - showing relays page");
   
-  String b = "<form method='POST' action='/relays/set'>";
-  b += "<div style='display:grid;grid-template-columns:1fr;gap:10px;'>";
+  String b = "<style>";
+  b += ".relay-card{background:#f9f9f9;padding:20px;border-radius:8px;margin-bottom:15px;border-left:4px solid #2196F3;display:flex;align-items:center;justify-content:space-between;}";
+  b += ".relay-label{font-size:18px;font-weight:500;}";
+  b += ".relay-status{font-weight:bold;font-size:14px;padding:5px 10px;border-radius:15px;}";
+  b += ".relay-status.on{background:#4CAF50;color:white;}";
+  b += ".relay-status.off{background:#f44336;color:white;}";
+  b += ".toggle-switch{position:relative;display:inline-block;width:60px;height:34px;}";
+  b += ".toggle-switch input{display:none;}";
+  b += ".toggle-slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background-color:#ccc;border-radius:34px;transition:.4s;}";
+  b += ".toggle-slider:before{position:absolute;content:'';height:26px;width:26px;left:4px;bottom:4px;background-color:white;border-radius:50%;transition:.4s;}";
+  b += "input:checked+.toggle-slider{background-color:#2196F3;}";
+  b += "input:checked+.toggle-slider:before{transform:translateX(26px);}";
+  b += ".toggle-slider:active{background-color:#2196F3;}";
+  b += "</style>";
+  
+  b += "<form method='POST' action='/relays/set'>";
+  
+  // Relay controls
   for (int i=0;i<8;i++) {
-    b += "<div style='padding:10px;background:#f9f9f9;border-radius:5px;'>";
-    b += "<label style='display:flex;align-items:center;cursor:pointer;'>";
-    b += "<input type='checkbox' name='r" + String(i+1) + "' " + (relayState[i] ? "checked" : "") + " style='margin-right:10px;width:20px;height:20px;'>";
-    b += "<span style='font-size:16px;'>Relay " + String(i+1) + " - <strong>" + String(relayState[i] ? "ON" : "OFF") + "</strong></span>";
-    b += "</label></div>";
+    b += "<div class='relay-card'>";
+    b += "<div class='relay-label'>🔌 Relay " + String(i+1) + "</div>";
+    b += "<div style='display:flex;align-items:center;gap:15px;'>";
+    b += "<div class='relay-status " + String(relayState[i] ? "on" : "off") + "'>" + String(relayState[i] ? "ON" : "OFF") + "</div>";
+    b += "<label class='toggle-switch'>";
+    String checkedAttr = relayState[i] ? "checked" : "";
+    b += "<input type='checkbox' name='r" + String(i+1) + "' " + checkedAttr + ">";
+    b += "<span class='toggle-slider'></span>";
+    b += "</label>";
+    b += "</div></div>";
   }
-  b += "</div>";
-  b += "<br/><input type='submit' value='Update Relays' style='width:100%;padding:15px;font-size:16px;'></form>";
+
+  b += "<br/><input id='updateRelays' type='submit' value='💾 Update Relays' style='width:100%;padding:15px;font-size:16px;margin-top:10px;display:none;'>";
+  b += "<script>$('.toggle-switch').on('click', function() {$('#updateRelays').trigger('click');});</script>";
+  b += "</form>";
   b += "<p style='margin-top:20px;'><a href='/'>← Back to Home</a> | <a href='/sensors'>View Sensors →</a></p>";
   
   server.send(200, "text/html", htmlTemplate("Relay Control", b));
@@ -1157,13 +1201,13 @@ void handleRelaysSet() {
   
   Serial.println("Auth passed - updating relays");
   
-  // update relayState according to checkboxes
-  for (int i=0;i<8;i++) {
-    String key = "r" + String(i+1);
+  // Handle form submission - update all relays
+  for (int i = 0; i < 8; i++) {
+    String key = "r" + String(i + 1);
     bool checked = server.hasArg(key);
     relayState[i] = checked ? 1 : 0;
     setRelayState(i, relayState[i]);
-    Serial.println("Relay " + String(i+1) + " set to: " + String(relayState[i]));
+    Serial.println("Relay " + String(i + 1) + " set to: " + String(relayState[i]));
   }
   
   // Submit updated relay status to backend
@@ -1306,14 +1350,25 @@ void setup() {
 
   loadPrefs();
 
-  // Display startup splash screen
+  // Display startup splash screen - Step 1: Company branding
   lcd.clear();
   lcd.setCursor(0,0);
-  lcd.write(0xF4); // Globe/world icon (custom character or built-in)
-  lcd.print(" OrbiqLabs");
+  lcd.print("Orbiq Labs IoT");
   lcd.setCursor(0,1);
-  lcd.print("IoT Device 001");
-  delay(2000); // Show splash for 2 seconds
+  lcd.print("iot.orbiqlabs.com");
+  delay(5000); // Show for 5 seconds
+
+  // Display startup splash screen - Step 2: Device info
+  lcd.clear();
+  lcd.setCursor(0,0);
+  String deviceLine = "ID:" + device_id;
+  if (deviceLine.length() > 16) deviceLine = deviceLine.substring(0, 16);
+  lcd.print(deviceLine);
+  lcd.setCursor(0,1);
+  String versionLine = "Ver:" + String(FIRMWARE_VERSION);
+  if (versionLine.length() > 16) versionLine = versionLine.substring(0, 16);
+  lcd.print(versionLine);
+  delay(3000); // Show for 3 seconds
 
   // Show WiFi configuration info
   lcd.clear();
@@ -1343,6 +1398,10 @@ void setup() {
     Serial.print("IP: ");   Serial.println(WiFi.localIP());
     Serial.print("Version: "); Serial.println(FIRMWARE_VERSION);
     digitalWrite(LED_WIFI_PIN, HIGH);
+
+    // Configure NTP time synchronization
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    Serial.println("⏰ NTP time synchronization configured");
 
     // Display WiFi connection success
     lcd.clear();
@@ -1413,7 +1472,7 @@ void cycleLCD() {
     return; // Don't cycle through normal screens
   }
   
-  if (millis() - lastCycle < 4000) return; // change every 4s
+  if (millis() - lastCycle < 3000) return; // change every 3s
   lastCycle = millis();
 
   if (navMode) {
@@ -1428,36 +1487,80 @@ void cycleLCD() {
     return;
   }
 
-  // normal cycling: sensors -> relays
-  if (slide == 0) {
-    float t = dht.readTemperature();
-    float h = dht.readHumidity();
-    lcd.clear();
-    lcd.setCursor(0,0);
-    lcd.print("DHT " + String(t,1) + "C");
-    lcd.setCursor(0,1);
-    lcd.print(String(h,0) + "% RH");
-    slide = 1;
-  } else if (slide == 1) {
-    ds18b20.requestTemperatures();
-    float t2 = ds18b20.getTempCByIndex(0);
-    lcd.clear();
-    lcd.setCursor(0,0);
-    lcd.print("DS18B20:");
-    lcd.setCursor(0,1);
-    lcd.print(String(t2,2) + " C");
-    slide = 2;
+  // Get current date and time
+  struct tm timeinfo;
+  char dateTimeStr[16]; // "12Nov15:30" = 9 chars + null terminator + space for WiFi
+  if (getLocalTime(&timeinfo)) {
+    strftime(dateTimeStr, sizeof(dateTimeStr), "%d%b%H:%M", &timeinfo);
   } else {
-    // show summary of relays as bits
-    lcd.clear();
-    lcd.setCursor(0,0);
-    lcd.print("R:");
-    String bits = "";
-    for (int i=0;i<8;i++) bits += (relayState[i] ? "1" : "0");
-    lcd.setCursor(2,0);
-    lcd.print(bits);
-    slide = 0;
+    strcpy(dateTimeStr, "00XXX00:00");
   }
+
+  // Get WiFi connection indicator (only show if connected)
+  String wifiIndicator = "";
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiIndicator = "W"; // Simple WiFi connected symbol
+  }
+
+  // Line 1: Always show date/time and WiFi indicator
+  lcd.clear();
+  lcd.setCursor(0,0);
+  String displayStr = String(dateTimeStr) + wifiIndicator;
+  if (displayStr.length() > 16) displayStr = displayStr.substring(0, 16);
+  lcd.print(displayStr);
+  
+  // Line 2: Cycle through single values
+  switch (slide) {
+    case 0: {
+      // Show temperature
+      ds18b20.requestTemperatures();
+      float t2 = ds18b20.getTempCByIndex(0);
+      if (t2 != DEVICE_DISCONNECTED_C) {
+        String tempStr = "Temp: " + String(t2, 1) + "C";
+        if (tempStr.length() > 16) tempStr = tempStr.substring(0, 16);
+        lcd.setCursor(0,1);
+        lcd.print(tempStr);
+      } else {
+        lcd.setCursor(0,1);
+        lcd.print("Temp: --.-C");
+      }
+      break;
+    }
+    case 1: {
+      // Show humidity
+      float h = dht.readHumidity();
+      if (!isnan(h)) {
+        String humStr = "Humidity: " + String(h, 0) + "%";
+        if (humStr.length() > 16) humStr = humStr.substring(0, 16);
+        lcd.setCursor(0,1);
+        lcd.print(humStr);
+      } else {
+        lcd.setCursor(0,1);
+        lcd.print("Humidity: --%");
+      }
+      break;
+    }
+    case 2: {
+      // Show relay status
+      String relayBits = "";
+      for (int i = 0; i < 8; i++) relayBits += String(relayState[i]);
+      String relayStr = "Relays:" + relayBits;
+      if (relayStr.length() > 16) relayStr = relayStr.substring(0, 16);
+      lcd.setCursor(0,1);
+      lcd.print(relayStr);
+      break;
+    }
+    case 3: {
+      // Show IP address
+      String ipStr = "IP:" + WiFi.localIP().toString();
+      if (ipStr.length() > 16) ipStr = ipStr.substring(0, 16);
+      lcd.setCursor(0,1);
+      lcd.print(ipStr);
+      break;
+    }
+  }
+  
+  slide = (slide + 1) % 4; // Cycle through 4 different displays
 }
 
 void handleButtons() {
