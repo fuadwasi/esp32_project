@@ -1,10 +1,10 @@
 /*
   ESP32 IoT System - Single-file sketch
-  Version: 1.0.5
+  Version: 1.0.6
   Last Updated: 2025-11-13
   
   Changelog:
-  - v1.0.5 (2025-11-13):
+  - v1.0.6 (2025-11-13):
     * Added NTP time synchronization for accurate LCD time display
     * Redesigned relay page with iOS/Android-style toggle switches
     * Implemented instant AJAX relay control (no save button needed)
@@ -58,7 +58,7 @@
     - Relays: relayPins[8] = {12, 13, 14, 27, 26, 25, 33, 32}
 */
 
-#define FIRMWARE_VERSION "1.0.5"
+#define FIRMWARE_VERSION "1.0.6"
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -104,10 +104,9 @@ const int DHT11_PIN = 4;
 const int DS18B20_PIN = 5;
 const int LED_WIFI_PIN = 2;
 
-const int BTN_WIFI_RESET = 23; // input only (use with pullup)
-const int BTN_NAV = 19;
-const int BTN_CFG = 17;
-const int BTN_TOGGLE = 18;
+const int BTN_WIFI_RESET = 18; // input only (use with pullup)
+const int BTN_OK = 17; // OK button for Info messages (input with pullup)
+const int BUZZER_PIN = 19; // buzzer pin (active high)
 
 // Relay pins (change to match your wiring)
 const int relayPins[8] = {12, 13, 14, 27, 26, 25, 33, 32};
@@ -164,16 +163,12 @@ String customMessage = "";
 unsigned long customMessageReceivedAt = 0;
 const unsigned long CUSTOM_MESSAGE_TIMEOUT = 5UL * 60UL * 1000UL; // 5 minutes
 
-// Local app modes & UI state
-bool navMode = false;
-unsigned long navModeStarted = 0;
-const unsigned long NAV_TIMEOUT = 30UL * 1000UL; // 30s
-
-bool cfgMode = false;
+// Info message handling (pauses LCD cycling until OK button pressed)
+bool infoMessageMode = false;
+String infoMessage = "";
+unsigned long infoMessageReceivedAt = 0;
 
 // Buttons debounce & press detection
-unsigned long btnWifiPressStart = 0;
-bool btnWifiPressed = false;
 const unsigned long WIFI_RESET_HOLD_MS = 5000; // 5 seconds
 
 // Sensor buffer for retrying posts
@@ -188,6 +183,18 @@ std::vector<SensorReading> pendingReadings;
 String sessionToken = "";
 unsigned long sessionCreatedAt = 0;
 const unsigned long SESSION_TIMEOUT = 3600UL * 1000UL; // 1 hour session timeout
+
+// Generate formatted timestamp for logging
+String getTimestamp() {
+  struct tm timeinfo;
+  char timestamp[20];
+  if (getLocalTime(&timeinfo)) {
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    return String(timestamp);
+  } else {
+    return "0000-00-00 00:00:00";
+  }
+}
 
 // Generate simple session token
 String generateSessionToken() {
@@ -388,45 +395,43 @@ void resetWifiSettings() {
   ESP.restart();
 }
 
-void checkAndResetWifiSettings() {
-  unsigned long held = millis() - btnWifiPressStart;
-    if (held >= WIFI_RESET_HOLD_MS) {
-      // do resetlcd.clear();
-      resetWifiSettings();
-    }
-}
-
 // ---------- IoT Device API Functions ----------
 
 bool getDeviceStatus(String &statusOut, bool &onlineOut) {
   HTTPClient http;
   String url = String(BACKEND_BASE_URL) + GET_STATUS_ENDPOINT;
-  
-  Serial.println("Getting device status from: " + url);
-  
+
+  Serial.println("[" + getTimestamp() + "] Getting device status from: " + url);
+
   http.begin(url);
   http.addHeader("X-ESP32-Device-Id", device_id);
   http.addHeader("X-IOT-Token", getValidJWT());
-  
+
   int code = http.GET();
   if (code > 0) {
     String resp = http.getString();
-    Serial.printf("Get Status response (%d): %s\n", code, resp.c_str());
-    
+    Serial.println("[" + getTimestamp() + "] Get Status response (" + String(code) + "): " + resp);
+
     if (code == 200) {
       // Parse JSON response
       StaticJsonDocument<512> doc;
       DeserializationError error = deserializeJson(doc, resp);
-      
+
       if (!error) {
         statusOut = doc["status"].as<String>();
         onlineOut = doc["online"].as<bool>();
         http.end();
         return true;
+      } else {
+        Serial.println("[" + getTimestamp() + "] JSON parsing error: " + String(error.c_str()));
       }
+    } else if (code == 404) {
+      Serial.println("[" + getTimestamp() + "] ❌ 404 Not Found - Device not registered in backend");
+    } else if (code == 401) {
+      Serial.println("[" + getTimestamp() + "] ❌ 401 Unauthorized - JWT token invalid");
     }
   } else {
-    Serial.printf("Get Status failed, error: %s\n", http.errorToString(code).c_str());
+    Serial.println("[" + getTimestamp() + "] Get Status failed, error: " + http.errorToString(code));
   }
   http.end();
   return false;
@@ -435,30 +440,77 @@ bool getDeviceStatus(String &statusOut, bool &onlineOut) {
 bool submitDeviceStatus(const String &statusString) {
   HTTPClient http;
   String url = String(BACKEND_BASE_URL) + POST_STATUS_ENDPOINT;
-  
-  Serial.println("Submitting device status to: " + url);
-  
+
+  Serial.println("[" + getTimestamp() + "] Submitting device status to: " + url);
+  Serial.println("[" + getTimestamp() + "] Device ID: " + device_id);
+
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-ESP32-Device-Id", device_id);
-  http.addHeader("X-IOT-Token", getValidJWT());
-  
+
+  String jwt = getValidJWT();
+  http.addHeader("X-IOT-Token", jwt);
+  Serial.println("[" + getTimestamp() + "] JWT Token present: " + String(jwt.length() > 0 ? "YES" : "NO"));
+  Serial.println("[" + getTimestamp() + "] JWT Token length: " + String(jwt.length()));
+
+
+  // Check if JWT is expired
+  if (jwt.length() > 0) {
+    // Parse JWT to check expiration (simple check)
+    int dot1 = jwt.indexOf('.');
+    int dot2 = jwt.indexOf('.', dot1 + 1);
+    if (dot1 > 0 && dot2 > dot1) {
+      String payload = jwt.substring(dot1 + 1, dot2);
+      // Base64 decode would be needed here, but for now just log
+      Serial.println("[" + getTimestamp() + "] JWT payload (base64): " + payload);
+    }
+  }
+
   StaticJsonDocument<128> doc;
-  doc["status"] = statusString;
-  
+  doc["formattedstatus"] = statusString;
+
   String payload;
   serializeJson(doc, payload);
-  
-  Serial.println("Status payload: " + payload);
-  
+
+  Serial.println("[" + getTimestamp() + "] Status payload: " + payload);
+  Serial.println("[" + getTimestamp() + "] Status string length: " + String(statusString.length()));
+  Serial.println("[" + getTimestamp() + "] Status string content: '" + statusString + "'");
+
   int code = http.POST(payload);
   if (code > 0) {
     String resp = http.getString();
-    Serial.printf("Submit Status response (%d): %s\n", code, resp.c_str());
+    Serial.println("[" + getTimestamp() + "] Submit Status response (" + String(code) + "): " + resp);
+
+    if (code == 400) {
+      Serial.println("[" + getTimestamp() + "] ❌ 400 Bad Request - Possible causes:");
+      Serial.println("[" + getTimestamp() + "]   1. Device '" + device_id + "' may not be registered in backend");
+      Serial.println("[" + getTimestamp() + "]   2. JWT token may be invalid or expired");
+      Serial.println("[" + getTimestamp() + "]   3. Status format may be incorrect (expected: string of 1-8 digits)");
+      Serial.println("[" + getTimestamp() + "]   4. API endpoint may require different authentication");
+
+      // Try to get device status to check if device exists
+      Serial.println("[" + getTimestamp() + "] Checking if device exists in backend...");
+      String checkStatus;
+      bool checkOnline;
+      if (getDeviceStatus(checkStatus, checkOnline)) {
+        Serial.println("[" + getTimestamp() + "] ✅ Device exists in backend (status: " + checkStatus + ", online: " + String(checkOnline) + ")");
+      } else {
+        Serial.println("[" + getTimestamp() + "] ❌ Device NOT found in backend or authentication failed");
+      }
+    } else if (code == 401) {
+      Serial.println("[" + getTimestamp() + "] ❌ 401 Unauthorized - JWT token is invalid");
+      // Clear cached JWT to force regeneration
+      cachedJWT = "";
+      jwtGeneratedAt = 0;
+      Serial.println("[" + getTimestamp() + "] Cleared cached JWT - will regenerate on next attempt");
+    } else if (code == 404) {
+      Serial.println("[" + getTimestamp() + "] ❌ 404 Not Found - Device not registered or wrong endpoint");
+    }
+
     http.end();
     return (code >= 200 && code < 300);
   } else {
-    Serial.printf("Submit Status failed, error: %s\n", http.errorToString(code).c_str());
+    Serial.println("[" + getTimestamp() + "] Submit Status failed, error: " + http.errorToString(code));
     http.end();
     return false;
   }
@@ -467,21 +519,21 @@ bool submitDeviceStatus(const String &statusString) {
 bool pingDevice() {
   HTTPClient http;
   String url = String(BACKEND_BASE_URL) + PING_ENDPOINT;
-  
-  Serial.println("Pinging device to: " + url);
-  
+
+  Serial.println("[" + getTimestamp() + "] Pinging device to: " + url);
+
   http.begin(url);
   http.addHeader("X-ESP32-Device-Id", device_id);
   http.addHeader("X-IOT-Token", getValidJWT());
-  
+
   int code = http.POST("");
   if (code > 0) {
     String resp = http.getString();
-    Serial.printf("Ping response (%d): %s\n", code, resp.c_str());
+    Serial.println("[" + getTimestamp() + "] Ping response (" + String(code) + "): " + resp);
     http.end();
     return (code >= 200 && code < 300);
   } else {
-    Serial.printf("Ping failed, error: %s\n", http.errorToString(code).c_str());
+    Serial.println("[" + getTimestamp() + "] Ping failed, error: " + http.errorToString(code));
     http.end();
     return false;
   }
@@ -634,25 +686,24 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
               String nestedType = nestedData.substring(nestedTypeStart + 1, nestedTypeEnd);
               Serial.println("🔖 Nested type: " + nestedType);
               
-              // If nested type is "Info", get the message and display on LCD
+              // Handle nested Info type
               if (nestedType == "Info") {
+                // Extract the message from "m" field
                 int nestedMIdx = nestedData.indexOf("\"m\":");
                 if (nestedMIdx >= 0) {
                   int nestedMsgStart = nestedData.indexOf('"', nestedMIdx + 4);
                   int nestedMsgEnd = nestedData.indexOf('"', nestedMsgStart + 1);
                   if (nestedMsgStart >= 0 && nestedMsgEnd >= 0) {
-                    String infoMessage = nestedData.substring(nestedMsgStart + 1, nestedMsgEnd);
-                    Serial.println("� Info message: " + infoMessage);
+                    String infoMessageText = nestedData.substring(nestedMsgStart + 1, nestedMsgEnd);
+                    Serial.println("ℹ️ Nested Info message: " + infoMessageText);
                     
-                    // Display on LCD for 5 minutes
-                    customMessage = infoMessage;
-                    customMessageMode = true;
-                    customMessageReceivedAt = millis();
-                    Serial.println("✅ Info message displayed on LCD (will auto-clear in 5 minutes)");
+                    // Display on LCD and wait for OK button press
+                    infoMessage = infoMessageText;
+                    infoMessageMode = true;
+                    infoMessageReceivedAt = millis();
+                    Serial.println("✅ Info message displayed on LCD - pausing cycling until OK button pressed");
                   }
                 }
-              } else {
-                Serial.println("ℹ️ Nested type '" + nestedType + "' - no action taken");
               }
             }
           }
@@ -663,8 +714,21 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       }
     }
   }
-  else {
-    Serial.println("⚠️ Unknown message type: " + msgType);
+  else if (msgType == "Buzz") {
+    // Activate buzzer
+    Serial.println("🔊 Buzz message received - activating buzzer");
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(500); // Buzz for 0.5 second
+    digitalWrite(BUZZER_PIN, LOW);
+    Serial.println("✅ Buzzer deactivated");
+  }
+  else if (msgType == "Info") {
+    // Info message - display on LCD and wait for OK button press
+    infoMessage = msgData;
+    infoMessageMode = true;
+    infoMessageReceivedAt = millis();
+    Serial.println("ℹ️ Info message received - pausing LCD cycling until OK button pressed");
+    Serial.println("   Message: " + infoMessage);
   }
   
   Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -733,9 +797,9 @@ bool postSensorReadings(const std::vector<SensorReading> &readings) {
   HTTPClient http;
   String url = String(BACKEND_BASE_URL) + SENSOR_POST_ENDPOINT;
 
-  Serial.println("Posting sensor readings to: " + url);
-  Serial.println("Device ID: " + device_id);
-  Serial.println("Number of readings: " + String(readings.size()));
+  Serial.println("[" + getTimestamp() + "] Posting sensor readings to: " + url);
+  Serial.println("[" + getTimestamp() + "] Device ID: " + device_id);
+  Serial.println("[" + getTimestamp() + "] Number of readings: " + String(readings.size()));
 
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
@@ -743,7 +807,7 @@ bool postSensorReadings(const std::vector<SensorReading> &readings) {
 
   String jwt = getValidJWT();
   http.addHeader("X-IOT-Token", jwt);
-  Serial.println("JWT Token: " + jwt.substring(0, 20) + "...");
+  Serial.println("[" + getTimestamp() + "] JWT Token: " + jwt.substring(0, 20) + "...");
 
   // Create JSON array of sensor readings
   StaticJsonDocument<2048> doc;
@@ -770,25 +834,25 @@ bool postSensorReadings(const std::vector<SensorReading> &readings) {
   String payload;
   serializeJson(doc, payload);
 
-  Serial.println("Request payload: " + payload);
+  Serial.println("[" + getTimestamp() + "] Request payload: " + payload);
 
   int code = http.POST(payload);
   if (code > 0) {
     String resp = http.getString();
-    Serial.printf("Sensor POST response (%d): %s\n", code, resp.c_str());
+    Serial.println("[" + getTimestamp() + "] Sensor POST response (" + String(code) + "): " + resp);
     http.end();
 
     if (code == 404) {
-      Serial.println("⚠️ 404 Error - Device may not be registered in backend or wrong endpoint");
-      Serial.println("Please verify:");
-      Serial.println("1. Device ID '" + device_id + "' is registered in the backend");
-      Serial.println("2. JWT secret matches the backend configuration");
-      Serial.println("3. API endpoint is correct: " + url);
+      Serial.println("[" + getTimestamp() + "] ⚠️ 404 Error - Device may not be registered in backend or wrong endpoint");
+      Serial.println("[" + getTimestamp() + "] Please verify:");
+      Serial.println("[" + getTimestamp() + "] 1. Device ID '" + device_id + "' is registered in the backend");
+      Serial.println("[" + getTimestamp() + "] 2. JWT secret matches the backend configuration");
+      Serial.println("[" + getTimestamp() + "] 3. API endpoint is correct: " + url);
     }
 
     return (code >= 200 && code < 300);
   } else {
-    Serial.printf("Sensor POST failed, error: %s\n", http.errorToString(code).c_str());
+    Serial.println("[" + getTimestamp() + "] Sensor POST failed, error: " + http.errorToString(code));
     http.end();
     return false;
   }
@@ -1211,13 +1275,13 @@ void handleRelaysSet() {
     bool checked = server.hasArg(key);
     relayState[i] = checked ? 1 : 0;
     setRelayState(i, relayState[i]);
-    Serial.println("Relay " + String(i + 1) + " set to: " + String(relayState[i]));
+    Serial.println("[" + getTimestamp() + "] Relay " + String(i + 1) + " set to: " + String(relayState[i]) + " (" + String(relayState[i] ? "ON" : "OFF") + ")");
   }
   
   // Submit updated relay status to backend
   postRelayUpdateToBackend(0, 0); // Index not used, submits all relays
   
-  Serial.println("Redirecting to /relays with success notification");
+  Serial.println("[" + getTimestamp() + "] Relay status updated and sent to backend API");
   server.sendHeader("Location", "/relays?updated=1");
   server.send(302);
 }
@@ -1336,10 +1400,9 @@ void setup() {
   // Pins
   pinMode(LED_WIFI_PIN, OUTPUT);
   pinMode(BTN_WIFI_RESET, INPUT_PULLUP);
-  pinMode(BTN_NAV, INPUT_PULLUP);
-  pinMode(BTN_CFG, INPUT_PULLUP);
-  pinMode(BTN_TOGGLE, INPUT_PULLUP);
-
+  pinMode(BTN_OK, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW); // Initialize buzzer OFF
 
   for (int i=0;i<8;i++) {
     pinMode(relayPins[i], OUTPUT);
@@ -1416,6 +1479,30 @@ void setup() {
     lcd.setCursor(0,1);
     lcd.print(WiFi.localIP());
     delay(2000); // Show IP for 2 seconds
+
+    // Display sensor initialization message and actively read sensors
+    Serial.println("🔄 Initializing sensors and syncing with backend...");
+    lcd.setCursor(0,0);
+    lcd.print("Sensors loading");
+    lcd.setCursor(0,1);
+    lcd.print("Please Wait.....");
+    
+    unsigned long sensorInitStart = millis();
+    
+    while (millis() - sensorInitStart < 30000) { // 30 seconds
+      // Read sensors
+      float t = dht.readTemperature();
+      float h = dht.readHumidity();
+      ds18b20.requestTemperatures();
+      float t2 = ds18b20.getTempCByIndex(0);
+      Serial.println("[" + getTimestamp() + "] DHT11 Temp: " + String(t) + " °C, Humidity: " + String(h) + " %, DS18B20 Temp: " + String(t2) + " °C");
+      // Wait 5 seconds before next reading
+      delay(5000);
+      }
+      
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(500);
+    digitalWrite(BUZZER_PIN, LOW);
   }
 
   Serial.println("Connected to WiFi: " + WiFi.SSID());
@@ -1453,6 +1540,21 @@ void cycleLCD() {
   static unsigned long lastCycle = 0;
   static int slide = 0;
   
+  // If in info message mode, show the info message and don't cycle
+  if (infoMessageMode) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("INFO:");
+    lcd.setCursor(0, 1);
+    // Display up to 16 characters of the info message
+    if (infoMessage.length() <= 16) {
+      lcd.print(infoMessage);
+    } else {
+      lcd.print(infoMessage.substring(0, 16));
+    }
+    return; // Don't cycle through normal screens
+  }
+  
   // If in custom message mode, show the custom message
   if (customMessageMode) {
     // Check if custom message has expired (5 minutes)
@@ -1480,18 +1582,6 @@ void cycleLCD() {
   
   if (millis() - lastCycle < 5000) return; // change every 5s
   lastCycle = millis();
-
-  if (navMode) {
-    // show relay statuses one by one
-    int idx = (millis() - navModeStarted) / 3000; // each 3s
-    idx = idx % 8;
-    lcd.clear();
-    lcd.setCursor(0,0);
-    lcd.print("Relay " + String(idx+1));
-    lcd.setCursor(0,1);
-    lcd.print(relayState[idx] ? "ON" : "OFF");
-    return;
-  }
 
   // Get current date and time
   struct tm timeinfo;
@@ -1571,81 +1661,55 @@ void cycleLCD() {
 }
 
 void handleButtons() {
-  // WiFi reset long press (BTN_WIFI_RESET)
-  bool pressed = (digitalRead(BTN_WIFI_RESET) == LOW); // active low
-  if (pressed && !btnWifiPressed) {
-    btnWifiPressed = true;
-    btnWifiPressStart = millis();
-    Serial.println("WiFi reset long press");
-    lcd.clear();
-    lcd.setCursor(0,0);
-    lcd.print("WiFi reset. press");
-    lcd.setCursor(0,1);
-    lcd.print("5s to reset");
-  } else if (!pressed && btnWifiPressed) {
-    btnWifiPressed = false;
-    checkAndResetWifiSettings();
-  } else if (pressed && btnWifiPressed) {
-    lcd.clear();
-    // still holding — nothing to do here; actual resetting is on release if hold met
-    Serial.println("still holding — nothing to do here; actual resetting is on release if hold met");
-    checkAndResetWifiSettings();
-  }
+  
+  //Serial.println("handleButtons called");
+  // WiFi reset long press (BTN_WIFI_RESET) - simplified logic
+  static unsigned long buttonPressStart = 0;
+  static bool buttonWasPressed = false;
 
-  // Navigation button: BTN_NAV
-  if (digitalRead(BTN_NAV) == LOW) {
-  Serial.println("digitalRead(BTN_NAV) == LOW");
-  Serial.println(digitalRead(BTN_NAV) == LOW);
-    // start nav mode
-    navMode = true;
-    navModeStarted = millis();
-  }
-  if (navMode && (millis() - navModeStarted > NAV_TIMEOUT)) {
-    navMode = false;
-  }
+  bool buttonPressed = (digitalRead(BTN_WIFI_RESET) == LOW); // active low
 
-  // Config mode: BTN_CFG toggles cfgMode
-  static bool lastCfgState = HIGH;
-  bool cfgState = digitalRead(BTN_CFG);
-  if (cfgState == LOW && lastCfgState == HIGH) {
-    // pressed
-    cfgMode = !cfgMode;
-    Serial.println(String("CFG mode: ") + (cfgMode ? "ON":"OFF"));
-  }
-  lastCfgState = cfgState;
+  if (buttonPressed && !buttonWasPressed) {
+    // Button just pressed
+    buttonPressStart = millis();
+    buttonWasPressed = true;
+    Serial.println("[" + getTimestamp() + "] WiFi reset button pressed - hold for 5 seconds to reset");
+  } else if (!buttonPressed && buttonWasPressed) {
+    // Button just released
+    buttonWasPressed = false;
+    unsigned long pressDuration = millis() - buttonPressStart;
 
-  // Toggle button: BTN_TOGGLE toggles currently selected relay in nav/cfg mode
-  // Also clears custom message mode when pressed
-  static bool lastToggleState = HIGH;
-  bool tState = digitalRead(BTN_TOGGLE);
-  if (tState == LOW && lastToggleState == HIGH) {
-    // pressed
-    if (customMessageMode) {
-      // Exit custom message mode
-      customMessageMode = false;
-      customMessage = "";
-      Serial.println("Custom message mode cleared by BTN_TOGGLE");
-    } else if (cfgMode) {
-      // in cfg mode toggle currently focused relay (if nav mode use focused idx)
-      int focusIdx = 0;
-      if (navMode) {
-        focusIdx = ((millis() - navModeStarted) / 3000) % 8;
-      } else {
-        // default focus 0
-        focusIdx = 0;
-      }
-      relayState[focusIdx] = relayState[focusIdx] ? 0 : 1;
-      setRelayState(focusIdx, relayState[focusIdx]);
-      // Update backend with new relay state
-      postRelayUpdateToBackend(focusIdx, relayState[focusIdx]);
-      Serial.println("Relay " + String(focusIdx) + " toggled locally to " + String(relayState[focusIdx]));
+    if (pressDuration >= WIFI_RESET_HOLD_MS) {
+      // Long press detected - reset WiFi
+      Serial.println("[" + getTimestamp() + "] WiFi reset confirmed - resetting settings");
+      resetWifiSettings();
     } else {
-      Serial.println("Toggle pressed but not in cfgMode or customMessageMode.");
+      Serial.println("[" + getTimestamp() + "] Button released too quickly - no reset");
+    }
+  } else if (buttonPressed && buttonWasPressed) {
+    // Button still being held
+    unsigned long holdTime = millis() - buttonPressStart;
+    if (holdTime >= WIFI_RESET_HOLD_MS && holdTime - (holdTime / 1000) * 1000 < 50) {
+      // Print progress every second while holding
+      Serial.println("[" + getTimestamp() + "] Holding... " + String(holdTime / 1000) + "s / 5s");
     }
   }
-  lastToggleState = tState;
 
-  
+  // OK button handling for Info messages
+  static bool okButtonWasPressed = false;
+  bool okButtonPressed = (digitalRead(BTN_OK) == LOW); // active low
+
+  if (okButtonPressed && !okButtonWasPressed && infoMessageMode) {
+    // OK button just pressed while in info mode
+    okButtonWasPressed = true;
+    Serial.println("[" + getTimestamp() + "] OK button pressed - exiting Info message mode");
+    infoMessageMode = false;
+    infoMessage = "";
+    Serial.println("✅ Info message acknowledged - resuming normal LCD cycling");
+  } else if (!okButtonPressed && okButtonWasPressed) {
+    // OK button just released
+    okButtonWasPressed = false;
+  }
 }
 
 
@@ -1686,7 +1750,7 @@ void loop() {
   // Periodic sensor read & send
   if (millis() - lastSensorMillis >= sensorInterval) {
     lastSensorMillis = millis();
-    Serial.println("Reading sensors...");
+    Serial.println("[" + getTimestamp() + "] Reading sensors...");
     float t = dht.readTemperature();
     float h = dht.readHumidity();
     ds18b20.requestTemperatures();
@@ -1696,34 +1760,25 @@ void loop() {
     std::vector<SensorReading> readings;
     if (!isnan(t)){
       readings.push_back( {SENSOR_DHT11_TEMP, t, "°C"} );
-      Serial.print("DHT11_Temperature: ");
-      Serial.print(t);
-      Serial.println(" °C");
+      Serial.println("[" + getTimestamp() + "] DHT11_Temperature: " + String(t, 2) + " °C");
     } 
     if (!isnan(h)) {  
       readings.push_back( {SENSOR_DHT11_HUMIDITY, h, "%"} );
-      Serial.print("DHT11_Humidity: ");
-      Serial.print(h);
-      Serial.println(" %");
+      Serial.println("[" + getTimestamp() + "] DHT11_Humidity: " + String(h, 1) + " %");
     }
     if (t2 != DEVICE_DISCONNECTED_C)
     {
       readings.push_back( {SENSOR_DS18B20_TEMP, t2, "°C"} );
        
       float tempF = ds18b20.toFahrenheit(t2);
-      Serial.print("DS18B20 Temperature: ");
-      Serial.print(t2);
-      Serial.println(" °C");
-      Serial.print("DS18B20 Temperature: ");
-      Serial.print(tempF);
-      Serial.println(" °F");
+      Serial.println("[" + getTimestamp() + "] DS18B20 Temperature: " + String(t2, 2) + " °C / " + String(tempF, 2) + " °F");
     }
 
     // try send
     bool ok = postSensorReadings(readings);
     if (!ok) {
       // buffer readings for retry
-      Serial.println("Buffering sensor readings for retry.");
+      Serial.println("[" + getTimestamp() + "] Buffering sensor readings for retry.");
       for (auto &r : readings) pendingReadings.push_back(r);
     } else {
       // if succeeded attempt send pending buffer too
@@ -1732,7 +1787,7 @@ void loop() {
         if (postSensorReadings(buffer)) {
           pendingReadings.clear();
         } else {
-          Serial.println("Still failed to send buffered readings.");
+          Serial.println("[" + getTimestamp() + "] Still failed to send buffered readings.");
         }
       }
     }
