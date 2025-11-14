@@ -1,9 +1,18 @@
 /*
   ESP32 IoT System - Single-file sketch
-  Version: 1.0.6
-  Last Updated: 2025-11-13
+  Version: 1.0.7
+  Last Updated: 2025-11-14
   
   Changelog:
+  - v1.0.7 (2025-11-14):
+    * Implemented sensor data storage and sync system
+    * Added LittleFS support for local data storage
+    * Sensor readings now saved to /sensor_data.json instead of immediate API sending
+    * Added 5-minute periodic data sync to API
+    * MQTT Sync message ({"t":"Sync","d":null}) triggers immediate data transmission
+    * MQTT Ping message now also sends stored sensor data
+    * Startup check for existing stored data and automatic transmission
+    * Improved data resilience during network outages
   - v1.0.6 (2025-11-13):
     * Added NTP time synchronization for accurate LCD time display
     * Redesigned relay page with iOS/Android-style toggle switches
@@ -48,6 +57,7 @@
     - PubSubClient (for MQTT)
     - ArduinoJson (bblanchon/ArduinoJson) - for JWT generation
     - mbedtls (built-in) - for HMAC SHA256
+    - LittleFS (built-in) - for sensor data storage
   
   Pin assignments (change if needed):
     - I2C SDA = 21, SCL = 22
@@ -58,7 +68,7 @@
     - Relays: relayPins[8] = {12, 13, 14, 27, 26, 25, 33, 32}
 */
 
-#define FIRMWARE_VERSION "1.0.6"
+#define FIRMWARE_VERSION "1.0.7"
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -75,6 +85,8 @@
 #include <DallasTemperature.h>
 #include <LiquidCrystal_I2C.h>
 #include <time.h>
+#include <FS.h>
+#include <LittleFS.h>
 
 // ---------- CONFIG ----------
 // Sensor Identifiers (unique for each sensor type)
@@ -118,6 +130,13 @@ const bool RELAY_ACTIVE_LOW = true;
 // Sensor intervals (ms)
 unsigned long sensorInterval = 60UL * 1000UL; // default 1 minute; configurable
 unsigned long lastSensorMillis = 0;
+
+// Data sync intervals (ms)
+unsigned long dataSyncInterval = 5UL * 60UL * 1000UL; // 5 minutes
+unsigned long lastDataSyncMillis = 0;
+
+// File paths for data storage
+#define SENSOR_DATA_FILE "/sensor_data.json"
 
 // WiFi and MQTT connection state tracking
 bool wasWiFiConnected = false;
@@ -177,7 +196,13 @@ struct SensorReading {
   float value;
   String unit;
 };
-std::vector<SensorReading> pendingReadings;
+
+// Device status struct for API responses
+struct DeviceStatus {
+  String status;
+  bool online;
+  bool success;
+};
 
 // Session management
 String sessionToken = "";
@@ -207,51 +232,34 @@ String generateSessionToken() {
 
 bool isSessionValid(const String &token) {
   if (token.length() == 0 || sessionToken.length() == 0) {
-    Serial.println("Session validation failed: empty token");
     return false;
   }
   if (token != sessionToken) {
-    Serial.println("Session validation failed: token mismatch");
-    Serial.println("Expected: " + sessionToken);
-    Serial.println("Received: " + token);
     return false;
   }
   
   // Check if session has expired
   unsigned long currentTime = millis();
   if (currentTime - sessionCreatedAt > SESSION_TIMEOUT) {
-    Serial.println("Session validation failed: expired");
     sessionToken = ""; // Clear expired session
     return false;
   }
   
-  Serial.println("Session validation successful");
   return true;
 }
 
 String getSessionCookie() {
-  // Debug: Print all headers
-  Serial.println("=== All HTTP Headers ===");
-  Serial.println("Headers count: " + String(server.headers()));
-  for (int i = 0; i < server.headers(); i++) {
-    Serial.println("Header[" + String(i) + "]: " + server.headerName(i) + " = " + server.header(i));
-  }
-  Serial.println("========================");
-  
   if (server.hasHeader("Cookie")) {
     String cookies = server.header("Cookie");
-    Serial.println("Cookies received: " + cookies);
     int idx = cookies.indexOf("ESPSESSION=");
     if (idx >= 0) {
       int endIdx = cookies.indexOf(';', idx);
       if (endIdx < 0) endIdx = cookies.length();
       String token = cookies.substring(idx + 11, endIdx);
       token.trim(); // Remove any whitespace
-      Serial.println("Session token from cookie: " + token);
       return token;
     }
   }
-  Serial.println("No session cookie found");
   return "";
 }
 
@@ -328,8 +336,6 @@ String generateJWT() {
   
   // Combine all parts
   String jwt = headerEncoded + "." + payloadEncoded + "." + signature;
-  
-  Serial.println("Generated JWT: " + jwt);
   return jwt;
 }
 
@@ -343,7 +349,6 @@ String getValidJWT() {
     // Generate new token (with 1 minute buffer before expiration)
     cachedJWT = generateJWT();
     jwtGeneratedAt = currentTime;
-    Serial.println("New JWT generated");
   }
   
   return cachedJWT;
@@ -378,6 +383,129 @@ void savePrefs() {
   prefs.end();
 }
 
+void saveSensorReadingToFile(const SensorReading &reading) {
+  // Load existing data from file
+  StaticJsonDocument<4096> doc;
+  JsonArray readingsArray;
+  
+  // Try to read existing file
+  if (LittleFS.exists(SENSOR_DATA_FILE)) {
+    File file = LittleFS.open(SENSOR_DATA_FILE, "r");
+    if (file) {
+      DeserializationError error = deserializeJson(doc, file);
+      file.close();
+      
+      if (!error) {
+        readingsArray = doc.as<JsonArray>();
+      } else {
+        // Create new array if file is corrupted
+        readingsArray = doc.to<JsonArray>();
+      }
+    } else {
+      // File doesn't exist, create new array
+      readingsArray = doc.to<JsonArray>();
+    }
+  } else {
+    // File doesn't exist, create new array
+    readingsArray = doc.to<JsonArray>();
+  }
+  
+  // Get current UTC time
+  struct tm timeinfo;
+  char timestamp[25];
+  if (getLocalTime(&timeinfo)) {
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+  } else {
+    strcpy(timestamp, "2024-01-01T00:00:00Z");
+  }
+  
+  // Add new reading to array
+  JsonObject readingObj = readingsArray.createNestedObject();
+  readingObj["sensorIdentifier"] = reading.name;
+  readingObj["numericValue"] = reading.value;
+  readingObj["textValue"] = String(reading.value, 2) + " " + reading.unit;
+  readingObj["capturedOnUtc"] = timestamp;
+  
+  // Save back to file
+  File file = LittleFS.open(SENSOR_DATA_FILE, "w");
+  if (file) {
+    serializeJson(doc, file);
+    file.close();
+  } else {
+  }
+}
+
+bool sendStoredSensorData() {
+  if (!LittleFS.exists(SENSOR_DATA_FILE)) {
+    return true; // Not an error, just no data to send
+  }
+  
+  File file = LittleFS.open(SENSOR_DATA_FILE, "r");
+  if (!file) {
+    return false;
+  }
+  
+  // Read file content
+  String fileContent = file.readString();
+  file.close();
+  
+  if (fileContent.length() == 0) {
+    LittleFS.remove(SENSOR_DATA_FILE);
+    return true;
+  }
+  
+  // Parse JSON
+  StaticJsonDocument<4096> doc;
+  DeserializationError error = deserializeJson(doc, fileContent);
+  
+  if (error) {
+    LittleFS.remove(SENSOR_DATA_FILE); // Remove corrupted file
+    return false;
+  }
+  
+  JsonArray readingsArray = doc.as<JsonArray>();
+  if (readingsArray.size() == 0) {
+    LittleFS.remove(SENSOR_DATA_FILE);
+    return true;
+  }
+  
+  // Send to API
+  HTTPClient http;
+  String url = String(BACKEND_BASE_URL) + SENSOR_POST_ENDPOINT;
+  
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-ESP32-Device-Id", device_id);
+  http.addHeader("X-IOT-Token", getValidJWT());
+  
+  String payload;
+  serializeJson(doc, payload);
+  
+  int code = http.POST(payload);
+  if (code > 0) {
+    String resp = http.getString();
+    Serial.println("[" + getTimestamp() + "] Stored data response (" + String(code) + "): " + resp);
+    
+    if (code >= 200 && code < 300) {
+      // Success - delete the file
+      LittleFS.remove(SENSOR_DATA_FILE);
+      http.end();
+      return true;
+    } else {
+    }
+  } else {
+  }
+  
+  http.end();
+  return false;
+}
+
+void checkAndSendStoredDataOnStartup() {
+  if (sendStoredSensorData()) {
+  } else {
+  }
+}
+
 void resetWifiSettings() {
   lcd.clear();
   lcd.setCursor(0,0);
@@ -397,7 +525,7 @@ void resetWifiSettings() {
 
 // ---------- IoT Device API Functions ----------
 
-bool getDeviceStatus(String &statusOut, bool &onlineOut) {
+DeviceStatus getDeviceStatus() {
   HTTPClient http;
   String url = String(BACKEND_BASE_URL) + GET_STATUS_ENDPOINT;
 
@@ -408,6 +536,8 @@ bool getDeviceStatus(String &statusOut, bool &onlineOut) {
   http.addHeader("X-IOT-Token", getValidJWT());
 
   int code = http.GET();
+  DeviceStatus result = {"", false}; // Default values
+  
   if (code > 0) {
     String resp = http.getString();
     Serial.println("[" + getTimestamp() + "] Get Status response (" + String(code) + "): " + resp);
@@ -418,31 +548,29 @@ bool getDeviceStatus(String &statusOut, bool &onlineOut) {
       DeserializationError error = deserializeJson(doc, resp);
 
       if (!error) {
-        statusOut = doc["status"].as<String>();
-        onlineOut = doc["online"].as<bool>();
+        result.status = doc["status"].as<String>();
+        result.online = doc["online"].as<bool>();
+        result.success = true;
         http.end();
-        return true;
+        return result;
       } else {
         Serial.println("[" + getTimestamp() + "] JSON parsing error: " + String(error.c_str()));
       }
-    } else if (code == 404) {
-      Serial.println("[" + getTimestamp() + "] ❌ 404 Not Found - Device not registered in backend");
-    } else if (code == 401) {
-      Serial.println("[" + getTimestamp() + "] ❌ 401 Unauthorized - JWT token invalid");
+    } else if (code == 404 || code == 401) {
+      Serial.println("[" + getTimestamp() + "] ❌ Device not found or unauthorized. Code: " + String(code));
     }
   } else {
     Serial.println("[" + getTimestamp() + "] Get Status failed, error: " + http.errorToString(code));
   }
   http.end();
-  return false;
+  return result;
 }
 
 bool submitDeviceStatus(const String &statusString) {
   HTTPClient http;
   String url = String(BACKEND_BASE_URL) + POST_STATUS_ENDPOINT;
 
-  Serial.println("[" + getTimestamp() + "] Submitting device status to: " + url);
-  Serial.println("[" + getTimestamp() + "] Device ID: " + device_id);
+  Serial.println("[" + getTimestamp() + "] Submitting device status to: " + url + " Device ID: " + device_id);
 
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
@@ -450,7 +578,6 @@ bool submitDeviceStatus(const String &statusString) {
 
   String jwt = getValidJWT();
   http.addHeader("X-IOT-Token", jwt);
-  Serial.println("[" + getTimestamp() + "] JWT Token present: " + String(jwt.length() > 0 ? "YES" : "NO"));
   Serial.println("[" + getTimestamp() + "] JWT Token length: " + String(jwt.length()));
 
 
@@ -490,10 +617,9 @@ bool submitDeviceStatus(const String &statusString) {
 
       // Try to get device status to check if device exists
       Serial.println("[" + getTimestamp() + "] Checking if device exists in backend...");
-      String checkStatus;
-      bool checkOnline;
-      if (getDeviceStatus(checkStatus, checkOnline)) {
-        Serial.println("[" + getTimestamp() + "] ✅ Device exists in backend (status: " + checkStatus + ", online: " + String(checkOnline) + ")");
+      DeviceStatus devStatus = getDeviceStatus();
+      if (devStatus.success) {
+        Serial.println("[" + getTimestamp() + "] ✅ Device exists in backend (status: " + devStatus.status + ", online: " + String(devStatus.online) + ")");
       } else {
         Serial.println("[" + getTimestamp() + "] ❌ Device NOT found in backend or authentication failed");
       }
@@ -536,29 +662,6 @@ bool pingDevice() {
     Serial.println("[" + getTimestamp() + "] Ping failed, error: " + http.errorToString(code));
     http.end();
     return false;
-  }
-}
-
-void setRelaysFromBackendJSON(const String &json) {
-  // naive parser expecting "Relay": { "1": 0, "2": 1, ... }
-  // This is simplistic, in production use ArduinoJson.
-  for (int i=1;i<=8;i++) {
-    String key = "\"" + String(i) + "\":";
-    int idx = json.indexOf(key);
-    if (idx >= 0) {
-      int valStart = idx + key.length();
-      if (valStart < (int)json.length()) {
-        char c = json[valStart];
-        if (c == ' ' || c == '\t') {
-          // skip whitespace
-          valStart++;
-          if (valStart < (int)json.length()) c = json[valStart];
-        }
-        int v = (c == '1') ? 1 : 0;
-        relayState[i-1] = v;
-        setRelayState(i-1, v);
-      }
-    }
   }
 }
 
@@ -650,9 +753,16 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     Serial.println("💬 Custom message set: " + customMessage + " (will auto-clear in 5 minutes)");
   }
   else if (msgType == "Ping") {
-    // Trigger immediate sensor reading and send ping to API
-    Serial.println("🏓 Ping received - triggering sensor read and API ping");
+    // Trigger immediate sensor reading and send ping to API, plus send stored data
+    Serial.println("🏓 Ping received - triggering sensor read, sending stored data, and API ping");
     lastSensorMillis = 0; // Force immediate sensor read in loop
+    
+    // Send stored sensor data
+    if (sendStoredSensorData()) {
+      Serial.println("✅ Stored sensor data sent successfully via Ping");
+    } else {
+      Serial.println("❌ Failed to send stored sensor data via Ping");
+    }
     
     // Send ping to backend API
     if (pingDevice()) {
@@ -708,10 +818,14 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
             }
           }
         }
-      } else {
-        // Data is a simple value, not an object
-        Serial.println("📦 Simple data: " + msgData);
       }
+    }
+    // Sync message - trigger sending of stored sensor data
+    Serial.println("🔄 Sync message received - sending stored sensor data");
+    if (sendStoredSensorData()) {
+      Serial.println("✅ Stored sensor data sent successfully via Sync");
+    } else {
+      Serial.println("❌ Failed to send stored sensor data via Sync");
     }
   }
   else if (msgType == "Buzz") {
@@ -785,94 +899,20 @@ void connectToMQTT() {
   }
 }
 
-bool ensureJWT() {
-  // Deprecated - JWT is now generated locally
-  // Kept for backward compatibility but always returns true
-  return true;
-}
-
-bool postSensorReadings(const std::vector<SensorReading> &readings) {
-  if (readings.empty()) return true;
-
-  HTTPClient http;
-  String url = String(BACKEND_BASE_URL) + SENSOR_POST_ENDPOINT;
-
-  Serial.println("[" + getTimestamp() + "] Posting sensor readings to: " + url);
-  Serial.println("[" + getTimestamp() + "] Device ID: " + device_id);
-  Serial.println("[" + getTimestamp() + "] Number of readings: " + String(readings.size()));
-
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-ESP32-Device-Id", device_id);
-
-  String jwt = getValidJWT();
-  http.addHeader("X-IOT-Token", jwt);
-  Serial.println("[" + getTimestamp() + "] JWT Token: " + jwt.substring(0, 20) + "...");
-
-  // Create JSON array of sensor readings
-  StaticJsonDocument<2048> doc;
-  JsonArray readingsArray = doc.to<JsonArray>();
-
-  // Get current UTC time for all readings
-  struct tm timeinfo;
-  char timestamp[25]; // ISO 8601 format: "2024-11-13T15:30:00Z"
-  if (getLocalTime(&timeinfo)) {
-    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
-  } else {
-    strcpy(timestamp, "2024-01-01T00:00:00Z"); // fallback
-  }
-
-  // Add each reading to the array
-  for (const auto &reading : readings) {
-    JsonObject readingObj = readingsArray.createNestedObject();
-    readingObj["sensorIdentifier"] = reading.name;
-    readingObj["numericValue"] = reading.value;
-    readingObj["textValue"] = String(reading.value, 2) + " " + reading.unit;
-    readingObj["capturedOnUtc"] = timestamp;
-  }
-
-  String payload;
-  serializeJson(doc, payload);
-
-  Serial.println("[" + getTimestamp() + "] Request payload: " + payload);
-
-  int code = http.POST(payload);
-  if (code > 0) {
-    String resp = http.getString();
-    Serial.println("[" + getTimestamp() + "] Sensor POST response (" + String(code) + "): " + resp);
-    http.end();
-
-    if (code == 404) {
-      Serial.println("[" + getTimestamp() + "] ⚠️ 404 Error - Device may not be registered in backend or wrong endpoint");
-      Serial.println("[" + getTimestamp() + "] Please verify:");
-      Serial.println("[" + getTimestamp() + "] 1. Device ID '" + device_id + "' is registered in the backend");
-      Serial.println("[" + getTimestamp() + "] 2. JWT secret matches the backend configuration");
-      Serial.println("[" + getTimestamp() + "] 3. API endpoint is correct: " + url);
-    }
-
-    return (code >= 200 && code < 300);
-  } else {
-    Serial.println("[" + getTimestamp() + "] Sensor POST failed, error: " + http.errorToString(code));
-    http.end();
-    return false;
-  }
-}
-
 bool fetchRelayStateFromBackend() {
   // Get device status which includes relay states
-  String status;
-  bool online;
+  DeviceStatus devStatus = getDeviceStatus();
   
-  if (getDeviceStatus(status, online)) {
-    Serial.println("Device status: " + status + ", Online: " + String(online));
+  if (devStatus.success) {
+    Serial.println("Device status: " + devStatus.status + ", Online: " + String(devStatus.online));
     
     // Parse status string (up to 8 characters representing relay states)
-    if (status.length() > 0) {
-      int numRelays = min(8, (int)status.length());
+    if (devStatus.status.length() > 0) {
+      int numRelays = min(8, (int)devStatus.status.length());
       Serial.println("Updating " + String(numRelays) + " relays from status string");
       
       for (int i = 0; i < numRelays; i++) {
-        int val = (status[i] == '1') ? 1 : 0;
+        int val = (devStatus.status[i] == '1') ? 1 : 0;
         relayState[i] = val;
         setRelayState(i, val);
         Serial.println("  Relay " + String(i + 1) + " set to: " + String(val) + " (" + String(val ? "ON" : "OFF") + ")");
@@ -912,13 +952,11 @@ bool checkWebAuth() {
   // Check if user has a valid session cookie
   String cookieToken = getSessionCookie();
   bool isValid = isSessionValid(cookieToken);
-  Serial.println("Auth check result: " + String(isValid ? "PASS" : "FAIL"));
   return isValid;
 }
 
 void requireAuth() {
   if (!checkWebAuth()) {
-    Serial.println("Authentication required - redirecting to login");
     server.sendHeader("Location", "/login");
     server.send(302);
   }
@@ -1016,14 +1054,10 @@ void handleLoginPost() {
   String username = server.arg("username");
   String password = server.arg("password");
   
-  Serial.println("Login attempt for user: " + username);
-  
   if (username == webUsername && password == webPassword) {
     // Create new session
     sessionToken = generateSessionToken();
     sessionCreatedAt = millis();
-    
-    Serial.println("Login successful! Session token: " + sessionToken);
     
     // Set session cookie - removed HttpOnly for better compatibility
     String cookie = "ESPSESSION=" + sessionToken + "; Path=/; Max-Age=3600";
@@ -1045,11 +1079,8 @@ void handleLoginPost() {
     
     server.send(200, "text/html", html);
     
-    Serial.println("Cookie set: " + cookie);
-    Serial.println("Redirecting to /sensors via JavaScript");
   } else {
     // Login failed
-    Serial.println("Login failed - invalid credentials");
     server.sendHeader("Location", "/login?error=1");
     server.send(302);
   }
@@ -1064,8 +1095,6 @@ void handleLogout() {
   server.sendHeader("Set-Cookie", "ESPSESSION=; Path=/; Max-Age=0");
   server.sendHeader("Location", "/login");
   server.send(302);
-  
-  Serial.println("User logged out");
 }
 
 void handleDiagnostics() {
@@ -1105,13 +1134,10 @@ void handleDiagnostics() {
 }
 
 void handleRoot() {
-  Serial.println("Root page requested");
   if (!checkWebAuth()) {
     requireAuth();
     return;
   }
-  
-  Serial.println("Auth passed - showing home page");
   
   // show sensor readings and relay controls
   String body = "<div style='text-align:center;padding:20px;'>";
@@ -1127,13 +1153,10 @@ void handleRoot() {
 }
 
 void handleSensorsPage() {
-  Serial.println("Sensors page requested");
   if (!checkWebAuth()) {
     requireAuth();
     return;
   }
-  
-  Serial.println("Auth passed - showing sensors page");
   
   float t = dht.readTemperature();
   float h = dht.readHumidity();
@@ -1213,13 +1236,10 @@ void handleSensorsPage() {
 }
 
 void handleRelaysPage() {
-  Serial.println("Relays page requested");
   if (!checkWebAuth()) {
     requireAuth();
     return;
   }
-  
-  Serial.println("Auth passed - showing relays page");
   
   String b = "<style>";
   b += ".relay-card{background:#f9f9f9;padding:20px;border-radius:8px;margin-bottom:15px;border-left:4px solid #2196F3;display:flex;align-items:center;justify-content:space-between;}";
@@ -1261,13 +1281,10 @@ void handleRelaysPage() {
 }
 
 void handleRelaysSet() {
-  Serial.println("Relay update requested");
   if (!checkWebAuth()) {
     requireAuth();
     return;
   }
-  
-  Serial.println("Auth passed - updating relays");
   
   // Handle form submission - update all relays
   for (int i = 0; i < 8; i++) {
@@ -1275,25 +1292,20 @@ void handleRelaysSet() {
     bool checked = server.hasArg(key);
     relayState[i] = checked ? 1 : 0;
     setRelayState(i, relayState[i]);
-    Serial.println("[" + getTimestamp() + "] Relay " + String(i + 1) + " set to: " + String(relayState[i]) + " (" + String(relayState[i] ? "ON" : "OFF") + ")");
   }
   
   // Submit updated relay status to backend
   postRelayUpdateToBackend(0, 0); // Index not used, submits all relays
   
-  Serial.println("[" + getTimestamp() + "] Relay status updated and sent to backend API");
   server.sendHeader("Location", "/relays?updated=1");
   server.send(302);
 }
 
 void handleConfigPage() {
-  Serial.println("Config page requested");
   if (!checkWebAuth()) {
     requireAuth();
     return;
   }
-  
-  Serial.println("Auth passed - showing config page");
   
   String b = "<form method='POST' action='/config/save'>";
   
@@ -1329,13 +1341,10 @@ void handleConfigPage() {
 }
 
 void handleConfigSave() {
-  Serial.println("Config save requested");
   if (!checkWebAuth()) {
     requireAuth();
     return;
   }
-  
-  Serial.println("Auth passed - saving config");
   
   // Device ID is read-only and cannot be changed from UI
   // if (server.hasArg("device_id")) device_id = server.arg("device_id");
@@ -1350,9 +1359,6 @@ void handleConfigSave() {
   jwtGeneratedAt = 0;
   
   savePrefs();
-  
-  Serial.println("Config saved successfully");
-  Serial.println("Redirecting to /config with success notification");
   
   server.sendHeader("Location", "/config?success=1");
   server.send(302);
@@ -1380,7 +1386,6 @@ void setupWebServerRoutes() {
 }
 
 void saveConfigCallback () {
-  Serial.println("WiFi credentials were just saved!");
 }
 
 
@@ -1388,12 +1393,7 @@ void saveConfigCallback () {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-  Serial.println("ESP32 IoT System");
-  Serial.println("Version: " + String(FIRMWARE_VERSION));
-  Serial.println("Starting up...");
-  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
+  
   // Initialize random seed for session tokens
   randomSeed(analogRead(0));
 
@@ -1414,6 +1414,11 @@ void setup() {
   ds18b20.begin();
   lcd.init();
   lcd.backlight();
+
+  // Initialize LittleFS for sensor data storage
+  if (!LittleFS.begin(true)) {
+  } else {
+  }
 
   loadPrefs();
 
@@ -1468,10 +1473,6 @@ void setup() {
     Serial.print("Version: "); Serial.println(FIRMWARE_VERSION);
     digitalWrite(LED_WIFI_PIN, HIGH);
 
-    // Configure NTP time synchronization
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-    Serial.println("⏰ NTP time synchronization configured");
-
     // Display WiFi connection success
     lcd.clear();
     lcd.setCursor(0,0);
@@ -1495,7 +1496,6 @@ void setup() {
       float h = dht.readHumidity();
       ds18b20.requestTemperatures();
       float t2 = ds18b20.getTempCByIndex(0);
-      Serial.println("[" + getTimestamp() + "] DHT11 Temp: " + String(t) + " °C, Humidity: " + String(h) + " %, DS18B20 Temp: " + String(t2) + " °C");
       // Wait 5 seconds before next reading
       delay(5000);
       }
@@ -1518,6 +1518,9 @@ void setup() {
   Serial.println("🔄 Initial relay state sync from backend...");
   fetchRelayStateFromBackend();
 
+  // Check for and send any stored sensor data from previous sessions
+  checkAndSendStoredDataOnStartup();
+
   // ensure we have credentials persisted
   savePrefs();
 
@@ -1526,13 +1529,6 @@ void setup() {
   // Initialize connection state tracking
   wasWiFiConnected = (WiFi.status() == WL_CONNECTED);
   wasMqttConnected = mqttClient.connected();
-  
-  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-  Serial.println("✅ System Ready!");
-  Serial.println("Firmware Version: " + String(FIRMWARE_VERSION));
-  Serial.println("Device ID: " + device_id);
-  Serial.println("IP Address: " + WiFi.localIP().toString());
-  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 }
 
 // ---------- Loop ----------
@@ -1747,7 +1743,7 @@ void loop() {
   // LED wifi indicator
   if (WiFi.status() == WL_CONNECTED) digitalWrite(LED_WIFI_PIN, HIGH); else digitalWrite(LED_WIFI_PIN, LOW);
 
-  // Periodic sensor read & send
+  // Periodic sensor read & save to file
   if (millis() - lastSensorMillis >= sensorInterval) {
     lastSensorMillis = millis();
     Serial.println("[" + getTimestamp() + "] Reading sensors...");
@@ -1757,39 +1753,33 @@ void loop() {
     float t2 = ds18b20.getTempCByIndex(0);
 
     // Validate readings (DHT can sometimes return NAN)
-    std::vector<SensorReading> readings;
     if (!isnan(t)){
-      readings.push_back( {SENSOR_DHT11_TEMP, t, "°C"} );
+      SensorReading reading = {SENSOR_DHT11_TEMP, t, "°C"};
+      saveSensorReadingToFile(reading);
       Serial.println("[" + getTimestamp() + "] DHT11_Temperature: " + String(t, 2) + " °C");
     } 
     if (!isnan(h)) {  
-      readings.push_back( {SENSOR_DHT11_HUMIDITY, h, "%"} );
+      SensorReading reading = {SENSOR_DHT11_HUMIDITY, h, "%"};
+      saveSensorReadingToFile(reading);
       Serial.println("[" + getTimestamp() + "] DHT11_Humidity: " + String(h, 1) + " %");
     }
     if (t2 != DEVICE_DISCONNECTED_C)
     {
-      readings.push_back( {SENSOR_DS18B20_TEMP, t2, "°C"} );
-       
+      SensorReading reading = {SENSOR_DS18B20_TEMP, t2, "°C"};
+      saveSensorReadingToFile(reading);
       float tempF = ds18b20.toFahrenheit(t2);
       Serial.println("[" + getTimestamp() + "] DS18B20 Temperature: " + String(t2, 2) + " °C / " + String(tempF, 2) + " °F");
     }
+  }
 
-    // try send
-    bool ok = postSensorReadings(readings);
-    if (!ok) {
-      // buffer readings for retry
-      Serial.println("[" + getTimestamp() + "] Buffering sensor readings for retry.");
-      for (auto &r : readings) pendingReadings.push_back(r);
+  // Periodic data sync (every 5 minutes)
+  if (millis() - lastDataSyncMillis >= dataSyncInterval) {
+    lastDataSyncMillis = millis();
+    Serial.println("[" + getTimestamp() + "] 🔄 Periodic data sync - sending stored sensor data");
+    if (sendStoredSensorData()) {
+      Serial.println("[" + getTimestamp() + "] ✅ Periodic data sync completed successfully");
     } else {
-      // if succeeded attempt send pending buffer too
-      if (!pendingReadings.empty()) {
-        std::vector<SensorReading> buffer = pendingReadings;
-        if (postSensorReadings(buffer)) {
-          pendingReadings.clear();
-        } else {
-          Serial.println("[" + getTimestamp() + "] Still failed to send buffered readings.");
-        }
-      }
+      Serial.println("[" + getTimestamp() + "] ❌ Periodic data sync failed - will retry later");
     }
   }
 
