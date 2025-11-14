@@ -142,6 +142,10 @@ unsigned long lastDataSyncMillis = 0;
 bool wasWiFiConnected = false;
 bool wasMqttConnected = false;
 
+// MQTT reconnection backoff
+unsigned long lastMqttReconnectAttempt = 0;
+const unsigned long MQTT_RECONNECT_INTERVAL = 5000UL; // 5 seconds minimum between attempts
+
 // DHT
 #define DHTTYPE DHT11
 DHT dht(DHT11_PIN, DHTTYPE);
@@ -1508,6 +1512,11 @@ void setup() {
   Serial.println("Connected to WiFi: " + WiFi.SSID());
   digitalWrite(LED_WIFI_PIN, HIGH);
 
+  // Configure NTP time synchronization
+  Serial.println("⏰ Configuring NTP time synchronization...");
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.println("✅ NTP configured");
+
   // Start web server
   setupWebServerRoutes();
 
@@ -1548,6 +1557,7 @@ void cycleLCD() {
     } else {
       lcd.print(infoMessage.substring(0, 16));
     }
+    delay(2000); // Show info message for 2 seconds
     return; // Don't cycle through normal screens
   }
   
@@ -1713,20 +1723,16 @@ void loop() {
   // Check WiFi connection status and handle reconnection
   bool isWiFiConnected = (WiFi.status() == WL_CONNECTED);
   if (!wasWiFiConnected && isWiFiConnected) {
-    // WiFi just reconnected
-    Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    Serial.println("📶 WiFi reconnected!");
-    Serial.println("   SSID: " + WiFi.SSID());
-    Serial.println("   IP: " + WiFi.localIP().toString());
-    Serial.println("🔄 Syncing relay states from backend after WiFi reconnection...");
+    Serial.println("📶 WiFi reconnected! SSID: " + WiFi.SSID() + "   IP: " + WiFi.localIP().toString() + "⏰ Reconfiguring NTP time synchronization...");
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
     fetchRelayStateFromBackend();
-    Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   }
   wasWiFiConnected = isWiFiConnected;
 
   // Maintain MQTT connection and detect reconnection
   bool isMqttConnected = mqttClient.connected();
-  if (!isMqttConnected) {
+  if (!isMqttConnected && (millis() - lastMqttReconnectAttempt >= MQTT_RECONNECT_INTERVAL)) {
+    lastMqttReconnectAttempt = millis();
     connectToMQTT();
     isMqttConnected = mqttClient.connected();
   }
