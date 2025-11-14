@@ -1,9 +1,16 @@
 /*
   ESP32 IoT System - Single-file sketch
-  Version: 1.0.7
-  Last Updated: 2025-11-14
+  Version: 1.0.8
+  Last Updated: 2025-11-15
   
   Changelog:
+  - v1.0.8 (2025-11-15):
+    * Removed sensor data storage in JSON format
+    * Reverted to immediate sensor data sending every 3 seconds
+    * Removed LittleFS filesystem usage
+    * Removed periodic data sync functionality
+    * Removed unused variables and functions
+    * Optimized code size and memory usage
   - v1.0.7 (2025-11-14):
     * Implemented sensor data storage and sync system
     * Added LittleFS support for local data storage
@@ -57,7 +64,6 @@
     - PubSubClient (for MQTT)
     - ArduinoJson (bblanchon/ArduinoJson) - for JWT generation
     - mbedtls (built-in) - for HMAC SHA256
-    - LittleFS (built-in) - for sensor data storage
   
   Pin assignments (change if needed):
     - I2C SDA = 21, SCL = 22
@@ -68,7 +74,7 @@
     - Relays: relayPins[8] = {12, 13, 14, 27, 26, 25, 33, 32}
 */
 
-#define FIRMWARE_VERSION "1.0.7"
+#define FIRMWARE_VERSION "1.0.8"
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -85,8 +91,6 @@
 #include <DallasTemperature.h>
 #include <LiquidCrystal_I2C.h>
 #include <time.h>
-#include <FS.h>
-#include <LittleFS.h>
 
 // ---------- CONFIG ----------
 // Sensor Identifiers (unique for each sensor type)
@@ -128,23 +132,16 @@ const int relayPins[8] = {12, 13, 14, 27, 26, 25, 33, 32};
 const bool RELAY_ACTIVE_LOW = true;
 
 // Sensor intervals (ms)
-unsigned long sensorInterval = 60UL * 1000UL; // default 1 minute; configurable
+unsigned long sensorInterval = 3000UL; // 3 seconds - immediate sending
 unsigned long lastSensorMillis = 0;
-
-// Data sync intervals (ms)
-unsigned long dataSyncInterval = 5UL * 60UL * 1000UL; // 5 minutes
-unsigned long lastDataSyncMillis = 0;
-
-// File paths for data storage
-#define SENSOR_DATA_FILE "/sensor_data.json"
 
 // WiFi and MQTT connection state tracking
 bool wasWiFiConnected = false;
 bool wasMqttConnected = false;
 
-// MQTT reconnection backoff
+// MQTT reconnection timing
 unsigned long lastMqttReconnectAttempt = 0;
-const unsigned long MQTT_RECONNECT_INTERVAL = 5000UL; // 5 seconds minimum between attempts
+const unsigned long MQTT_RECONNECT_INTERVAL = 5000UL; // 5 seconds
 
 // DHT
 #define DHTTYPE DHT11
@@ -193,13 +190,6 @@ unsigned long infoMessageReceivedAt = 0;
 
 // Buttons debounce & press detection
 const unsigned long WIFI_RESET_HOLD_MS = 5000; // 5 seconds
-
-// Sensor buffer for retrying posts
-struct SensorReading {
-  String name;
-  float value;
-  String unit;
-};
 
 // Device status struct for API responses
 struct DeviceStatus {
@@ -387,129 +377,6 @@ void savePrefs() {
   prefs.end();
 }
 
-void saveSensorReadingToFile(const SensorReading &reading) {
-  // Load existing data from file
-  StaticJsonDocument<4096> doc;
-  JsonArray readingsArray;
-  
-  // Try to read existing file
-  if (LittleFS.exists(SENSOR_DATA_FILE)) {
-    File file = LittleFS.open(SENSOR_DATA_FILE, "r");
-    if (file) {
-      DeserializationError error = deserializeJson(doc, file);
-      file.close();
-      
-      if (!error) {
-        readingsArray = doc.as<JsonArray>();
-      } else {
-        // Create new array if file is corrupted
-        readingsArray = doc.to<JsonArray>();
-      }
-    } else {
-      // File doesn't exist, create new array
-      readingsArray = doc.to<JsonArray>();
-    }
-  } else {
-    // File doesn't exist, create new array
-    readingsArray = doc.to<JsonArray>();
-  }
-  
-  // Get current UTC time
-  struct tm timeinfo;
-  char timestamp[25];
-  if (getLocalTime(&timeinfo)) {
-    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
-  } else {
-    strcpy(timestamp, "2024-01-01T00:00:00Z");
-  }
-  
-  // Add new reading to array
-  JsonObject readingObj = readingsArray.createNestedObject();
-  readingObj["sensorIdentifier"] = reading.name;
-  readingObj["numericValue"] = reading.value;
-  readingObj["textValue"] = String(reading.value, 2) + " " + reading.unit;
-  readingObj["capturedOnUtc"] = timestamp;
-  
-  // Save back to file
-  File file = LittleFS.open(SENSOR_DATA_FILE, "w");
-  if (file) {
-    serializeJson(doc, file);
-    file.close();
-  } else {
-  }
-}
-
-bool sendStoredSensorData() {
-  if (!LittleFS.exists(SENSOR_DATA_FILE)) {
-    return true; // Not an error, just no data to send
-  }
-  
-  File file = LittleFS.open(SENSOR_DATA_FILE, "r");
-  if (!file) {
-    return false;
-  }
-  
-  // Read file content
-  String fileContent = file.readString();
-  file.close();
-  
-  if (fileContent.length() == 0) {
-    LittleFS.remove(SENSOR_DATA_FILE);
-    return true;
-  }
-  
-  // Parse JSON
-  StaticJsonDocument<4096> doc;
-  DeserializationError error = deserializeJson(doc, fileContent);
-  
-  if (error) {
-    LittleFS.remove(SENSOR_DATA_FILE); // Remove corrupted file
-    return false;
-  }
-  
-  JsonArray readingsArray = doc.as<JsonArray>();
-  if (readingsArray.size() == 0) {
-    LittleFS.remove(SENSOR_DATA_FILE);
-    return true;
-  }
-  
-  // Send to API
-  HTTPClient http;
-  String url = String(BACKEND_BASE_URL) + SENSOR_POST_ENDPOINT;
-  
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-ESP32-Device-Id", device_id);
-  http.addHeader("X-IOT-Token", getValidJWT());
-  
-  String payload;
-  serializeJson(doc, payload);
-  
-  int code = http.POST(payload);
-  if (code > 0) {
-    String resp = http.getString();
-    Serial.println("[" + getTimestamp() + "] Stored data response (" + String(code) + "): " + resp);
-    
-    if (code >= 200 && code < 300) {
-      // Success - delete the file
-      LittleFS.remove(SENSOR_DATA_FILE);
-      http.end();
-      return true;
-    } else {
-    }
-  } else {
-  }
-  
-  http.end();
-  return false;
-}
-
-void checkAndSendStoredDataOnStartup() {
-  if (sendStoredSensorData()) {
-  } else {
-  }
-}
-
 void resetWifiSettings() {
   lcd.clear();
   lcd.setCursor(0,0);
@@ -525,6 +392,50 @@ void resetWifiSettings() {
   // Optionally also clear stored API/web credentials?
   // prefs.begin("iotcfg", false); prefs.clear(); prefs.end();
   ESP.restart();
+}
+
+// Send sensor reading immediately to API
+bool sendSensorReading(const String &sensorId, float value, const String &unit) {
+  HTTPClient http;
+  String url = String(BACKEND_BASE_URL) + SENSOR_POST_ENDPOINT;
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-ESP32-Device-Id", device_id);
+  http.addHeader("X-IOT-Token", getValidJWT());
+
+  // Get current UTC time
+  struct tm timeinfo;
+  char timestamp[25];
+  if (getLocalTime(&timeinfo)) {
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+  } else {
+    strcpy(timestamp, "2024-01-01T00:00:00Z");
+  }
+
+  // Create JSON payload for single reading
+  StaticJsonDocument<256> doc;
+  JsonArray readingsArray = doc.to<JsonArray>();
+  JsonObject readingObj = readingsArray.createNestedObject();
+  readingObj["sensorIdentifier"] = sensorId;
+  readingObj["numericValue"] = value;
+  readingObj["textValue"] = String(value, 2) + " " + unit;
+  readingObj["capturedOnUtc"] = timestamp;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  int code = http.POST(payload);
+  if (code > 0) {
+    String resp = http.getString();
+    Serial.println("[" + getTimestamp() + "] Sensor data response (" + String(code) + "): " + resp);
+    http.end();
+    return (code >= 200 && code < 300);
+  } else {
+    Serial.println("[" + getTimestamp() + "] Sensor data send failed, error: " + http.errorToString(code));
+    http.end();
+    return false;
+  }
 }
 
 // ---------- IoT Device API Functions ----------
@@ -757,17 +668,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     Serial.println("💬 Custom message set: " + customMessage + " (will auto-clear in 5 minutes)");
   }
   else if (msgType == "Ping") {
-    // Trigger immediate sensor reading and send ping to API, plus send stored data
-    Serial.println("🏓 Ping received - triggering sensor read, sending stored data, and API ping");
+    // Trigger immediate sensor reading and send ping to API
+    Serial.println("🏓 Ping received - triggering sensor read and API ping");
     lastSensorMillis = 0; // Force immediate sensor read in loop
-    
-    // Send stored sensor data
-    if (sendStoredSensorData()) {
-      Serial.println("✅ Stored sensor data sent successfully via Ping");
-    } else {
-      Serial.println("❌ Failed to send stored sensor data via Ping");
-    }
-    
+
     // Send ping to backend API
     if (pingDevice()) {
       Serial.println("✅ Ping sent successfully to backend");
@@ -778,7 +682,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   else if (msgType == "Sync") {
     // Sync message - parse nested data object
     Serial.println("🔄 Sync message received");
-    
+
     // Parse nested data: {"t":"Info","m":"hi fuad"}
     // The "d" field contains another JSON object, not a string
     int nestedDIdx = message.indexOf("\"d\":", typeEnd);
@@ -790,7 +694,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         if (objEnd >= 0) {
           String nestedData = message.substring(objStart, objEnd + 1);
           Serial.println("📦 Nested data: " + nestedData);
-          
+
           // Parse nested type
           int nestedTIdx = nestedData.indexOf("\"t\":");
           if (nestedTIdx >= 0) {
@@ -799,7 +703,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
             if (nestedTypeStart >= 0 && nestedTypeEnd >= 0) {
               String nestedType = nestedData.substring(nestedTypeStart + 1, nestedTypeEnd);
               Serial.println("🔖 Nested type: " + nestedType);
-              
+
               // Handle nested Info type
               if (nestedType == "Info") {
                 // Extract the message from "m" field
@@ -810,7 +714,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
                   if (nestedMsgStart >= 0 && nestedMsgEnd >= 0) {
                     String infoMessageText = nestedData.substring(nestedMsgStart + 1, nestedMsgEnd);
                     Serial.println("ℹ️ Nested Info message: " + infoMessageText);
-                    
+
                     // Display on LCD and wait for OK button press
                     infoMessage = infoMessageText;
                     infoMessageMode = true;
@@ -823,13 +727,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
           }
         }
       }
-    }
-    // Sync message - trigger sending of stored sensor data
-    Serial.println("🔄 Sync message received - sending stored sensor data");
-    if (sendStoredSensorData()) {
-      Serial.println("✅ Stored sensor data sent successfully via Sync");
-    } else {
-      Serial.println("❌ Failed to send stored sensor data via Sync");
     }
   }
   else if (msgType == "Buzz") {
@@ -1419,11 +1316,6 @@ void setup() {
   lcd.init();
   lcd.backlight();
 
-  // Initialize LittleFS for sensor data storage
-  if (!LittleFS.begin(true)) {
-  } else {
-  }
-
   loadPrefs();
 
   // Display startup splash screen - Step 1: Company branding
@@ -1526,9 +1418,6 @@ void setup() {
   // Sync relay states from backend on startup
   Serial.println("🔄 Initial relay state sync from backend...");
   fetchRelayStateFromBackend();
-
-  // Check for and send any stored sensor data from previous sessions
-  checkAndSendStoredDataOnStartup();
 
   // ensure we have credentials persisted
   savePrefs();
@@ -1760,32 +1649,18 @@ void loop() {
 
     // Validate readings (DHT can sometimes return NAN)
     if (!isnan(t)){
-      SensorReading reading = {SENSOR_DHT11_TEMP, t, "°C"};
-      saveSensorReadingToFile(reading);
+      sendSensorReading(SENSOR_DHT11_TEMP, t, "°C");
       Serial.println("[" + getTimestamp() + "] DHT11_Temperature: " + String(t, 2) + " °C");
     } 
     if (!isnan(h)) {  
-      SensorReading reading = {SENSOR_DHT11_HUMIDITY, h, "%"};
-      saveSensorReadingToFile(reading);
+      sendSensorReading(SENSOR_DHT11_HUMIDITY, h, "%");
       Serial.println("[" + getTimestamp() + "] DHT11_Humidity: " + String(h, 1) + " %");
     }
     if (t2 != DEVICE_DISCONNECTED_C)
     {
-      SensorReading reading = {SENSOR_DS18B20_TEMP, t2, "°C"};
-      saveSensorReadingToFile(reading);
+      sendSensorReading(SENSOR_DS18B20_TEMP, t2, "°C");
       float tempF = ds18b20.toFahrenheit(t2);
       Serial.println("[" + getTimestamp() + "] DS18B20 Temperature: " + String(t2, 2) + " °C / " + String(tempF, 2) + " °F");
-    }
-  }
-
-  // Periodic data sync (every 5 minutes)
-  if (millis() - lastDataSyncMillis >= dataSyncInterval) {
-    lastDataSyncMillis = millis();
-    Serial.println("[" + getTimestamp() + "] 🔄 Periodic data sync - sending stored sensor data");
-    if (sendStoredSensorData()) {
-      Serial.println("[" + getTimestamp() + "] ✅ Periodic data sync completed successfully");
-    } else {
-      Serial.println("[" + getTimestamp() + "] ❌ Periodic data sync failed - will retry later");
     }
   }
 
