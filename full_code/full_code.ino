@@ -97,7 +97,7 @@
 #define SENSOR_DHT11_TEMP "dht11-temperature"
 #define SENSOR_DHT11_HUMIDITY "dht11-humidity"
 #define SENSOR_DS18B20_TEMP "ds18b20-temperature"
-#define BACKEND_BASE_URL "https://151a2614ac38.ngrok-free.app" // IoT Device API base URL
+#define BACKEND_BASE_URL_DEFAULT "https://iot.orbiqlabs.com" // IoT Device API base URL default
 #define SENSOR_POST_ENDPOINT "/api-iot/device/sensor-readings"
 #define GET_STATUS_ENDPOINT "/api-iot/device/status"
 #define POST_STATUS_ENDPOINT "/api-iot/device/status"
@@ -170,6 +170,7 @@ String apiUsername = "admin";
 String apiPassword = "admin";
 String webUsername = "admin";
 String webPassword = "admin";
+String backendBaseUrl = BACKEND_BASE_URL_DEFAULT;
 
 String cachedJWT = "";
 unsigned long jwtGeneratedAt = 0;
@@ -202,6 +203,21 @@ struct DeviceStatus {
 String sessionToken = "";
 unsigned long sessionCreatedAt = 0;
 const unsigned long SESSION_TIMEOUT = 3600UL * 1000UL; // 1 hour session timeout
+
+struct SensorMetadata {
+  const char* id;
+  const char* label;
+  const char* unit;
+  uint8_t decimals;
+};
+
+constexpr SensorMetadata SENSOR_METADATA[] = {
+  {SENSOR_DHT11_TEMP, "DHT11 Temperature", "°C", 2},
+  {SENSOR_DHT11_HUMIDITY, "DHT11 Humidity", "%", 1},
+  {SENSOR_DS18B20_TEMP, "DS18B20 Temperature", "°C", 2}
+};
+
+constexpr size_t SENSOR_COUNT = sizeof(SENSOR_METADATA) / sizeof(SENSOR_METADATA[0]);
 
 // Generate formatted timestamp for logging
 String getTimestamp() {
@@ -351,7 +367,7 @@ String getValidJWT() {
 // Helper function to create configured HTTPClient
 HTTPClient* createConfiguredHTTPClient(const String& endpoint, const String& contentType = "application/json") {
   HTTPClient* http = new HTTPClient();
-  String url = String(BACKEND_BASE_URL) + endpoint;
+  String url = backendBaseUrl + endpoint;
   http->begin(url);
   http->addHeader("X-ESP32-Device-Id", device_id);
   http->addHeader("X-IOT-Token", getValidJWT());
@@ -397,6 +413,7 @@ void loadPrefs() {
   webUsername = prefs.getString("webUser", "admin");
   webPassword = prefs.getString("webPass", "admin");
   sensorInterval = prefs.getULong("sensInterval", 30000UL);
+  backendBaseUrl = prefs.getString("backendUrl", BACKEND_BASE_URL_DEFAULT);
   prefs.end();
 }
 
@@ -409,6 +426,7 @@ void savePrefs() {
   prefs.putString("webUser", webUsername);
   prefs.putString("webPass", webPassword);
   prefs.putULong("sensInterval", sensorInterval);
+  prefs.putString("backendUrl", backendBaseUrl);
   prefs.end();
 }
 
@@ -430,16 +448,38 @@ void resetWifiSettings() {
 }
 
 // Helper function to add a sensor reading to the batch JSON array
-void addSensorReadingToBatch(JsonArray& readingsArray, const String& sensorId, float value, const String& unit, const String& timestamp) {
+void addSensorReadingToBatch(JsonArray& readingsArray, const SensorMetadata& meta, const float& value, const char* timestamp) {
   JsonObject readingObj = readingsArray.createNestedObject();
-  readingObj["sensorIdentifier"] = sensorId;
+  readingObj["sensorIdentifier"] = meta.id;
   readingObj["numericValue"] = value;
-  readingObj["textValue"] = String(value, unit == "%" ? 1 : 2) + " " + unit;
+  readingObj["textValue"] = String(value, static_cast<unsigned int>(meta.decimals)) + " " + meta.unit;
   readingObj["capturedOnUtc"] = timestamp;
 }
 
+// Helper function to print sensor readings to Serial Monitor
+void logSensorReadings(const String& logPrefix, const float* values, const bool* validity, size_t count) {
+  const size_t cappedCount = min(count, SENSOR_COUNT);
+  for (size_t i = 0; i < cappedCount; ++i) {
+    const auto& meta = SENSOR_METADATA[i];
+    const bool isValid = validity ? validity[i] : true;
+
+    Serial.print(logPrefix);
+    Serial.print("  ");
+    Serial.print(meta.label);
+    Serial.print(": ");
+
+    if (isValid) {
+      Serial.print(values[i], meta.decimals);
+      Serial.print(" ");
+      Serial.println(meta.unit);
+    } else {
+      Serial.println("INVALID");
+    }
+  }
+}
+
 // Send sensor readings as a batch (all sensors together)
-bool sendSensorReadingsBatch(float dhtTemp, float dhtHumidity, float ds18Temp) {
+bool sendSensorReadingsBatch(const float& dhtTemp, const float& dhtHumidity, const float& ds18Temp) {
   HTTPClient* http = createConfiguredHTTPClient(SENSOR_POST_ENDPOINT);
 
   // Get current UTC time
@@ -455,18 +495,19 @@ bool sendSensorReadingsBatch(float dhtTemp, float dhtHumidity, float ds18Temp) {
   StaticJsonDocument<512> doc;
   JsonArray readingsArray = doc.to<JsonArray>();
 
-  // Add all sensor readings using the helper function
-  addSensorReadingToBatch(readingsArray, SENSOR_DHT11_TEMP, dhtTemp, "°C", timestamp);
-  addSensorReadingToBatch(readingsArray, SENSOR_DHT11_HUMIDITY, dhtHumidity, "%", timestamp);
-  addSensorReadingToBatch(readingsArray, SENSOR_DS18B20_TEMP, ds18Temp, "°C", timestamp);
+  const float sensorValues[] = {dhtTemp, dhtHumidity, ds18Temp};
+
+  for (size_t i = 0; i < SENSOR_COUNT; ++i) {
+    addSensorReadingToBatch(readingsArray, SENSOR_METADATA[i], sensorValues[i], timestamp);
+  }
 
   String payload;
   serializeJson(doc, payload);
 
-  Serial.println("[" + getTimestamp() + "] Sending sensor readings batch:");
-  Serial.println("[" + getTimestamp() + "]   DHT11 Temp: " + String(dhtTemp, 2) + " °C");
-  Serial.println("[" + getTimestamp() + "]   DHT11 Humidity: " + String(dhtHumidity, 1) + " %");
-  Serial.println("[" + getTimestamp() + "]   DS18B20 Temp: " + String(ds18Temp, 2) + " °C");
+  const String logPrefix = "[" + getTimestamp() + "] ";
+  Serial.println(logPrefix + "Sending sensor readings batch:");
+  const bool allValidFlags[SENSOR_COUNT] = {true, true, true};
+  logSensorReadings(logPrefix, sensorValues, allValidFlags, SENSOR_COUNT);
 
   int code = http->POST(payload);
   if (code > 0) {
@@ -492,7 +533,7 @@ bool sendSensorReadingsBatch(float dhtTemp, float dhtHumidity, float ds18Temp) {
 DeviceStatus getDeviceStatus() {
   HTTPClient* http = createConfiguredHTTPClient(GET_STATUS_ENDPOINT, "");
 
-  Serial.println("[" + getTimestamp() + "] Getting device status from: " + String(BACKEND_BASE_URL) + GET_STATUS_ENDPOINT);
+  Serial.println("[" + getTimestamp() + "] Getting device status from: " + backendBaseUrl + GET_STATUS_ENDPOINT);
 
   int code = http->GET();
   DeviceStatus result = {"", false}; // Default values
@@ -530,7 +571,7 @@ DeviceStatus getDeviceStatus() {
 bool submitDeviceStatus(const String &statusString) {
   HTTPClient* http = createConfiguredHTTPClient(POST_STATUS_ENDPOINT);
 
-  Serial.println("[" + getTimestamp() + "] Submitting device status to: " + String(BACKEND_BASE_URL) + POST_STATUS_ENDPOINT + " Device ID: " + device_id);
+  Serial.println("[" + getTimestamp() + "] Submitting device status to: " + backendBaseUrl + POST_STATUS_ENDPOINT + " Device ID: " + device_id);
 
   String jwt = getValidJWT();
   Serial.println("[" + getTimestamp() + "] JWT Token length: " + String(jwt.length()));
@@ -582,7 +623,7 @@ bool submitDeviceStatus(const String &statusString) {
 bool pingDevice() {
   HTTPClient* http = createConfiguredHTTPClient(PING_ENDPOINT);
 
-  Serial.println("[" + getTimestamp() + "] Pinging device to: " + String(BACKEND_BASE_URL) + PING_ENDPOINT);
+  Serial.println("[" + getTimestamp() + "] Pinging device to: " + backendBaseUrl + PING_ENDPOINT);
 
   int code = http->POST("");
   if (code > 0) {
@@ -643,14 +684,29 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String msgData = "";
   
   if (dIdx >= 0) {
-    int dataStart = message.indexOf('"', dIdx + 4);
-    if (dataStart >= 0) {
-      int dataEnd = message.indexOf('"', dataStart + 1);
-      if (dataEnd >= 0) {
-        msgData = message.substring(dataStart + 1, dataEnd);
+    // Skip "d": and find the value
+    int valueStart = dIdx + 4; // after "d":
+    // Skip whitespace
+    while (valueStart < message.length() && message[valueStart] == ' ') valueStart++;
+    
+    if (valueStart < message.length()) {
+      if (message[valueStart] == '"') {
+        // String value
+        int dataStart = valueStart + 1;
+        int dataEnd = message.indexOf('"', dataStart);
+        if (dataEnd >= 0) {
+          msgData = message.substring(dataStart, dataEnd);
+        }
+      } else if (message.substring(valueStart, valueStart + 4) == "null") {
+        msgData = "null";
+      } else {
+        // Numeric value or other
+        int dataEnd = message.indexOf(',', valueStart);
+        if (dataEnd < 0) dataEnd = message.indexOf('}', valueStart);
+        if (dataEnd >= 0) {
+          msgData = message.substring(valueStart, dataEnd);
+        }
       }
-    } else if (message.indexOf("null", dIdx + 4) >= 0) {
-      msgData = "null";
     }
   }
 
@@ -756,9 +812,13 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
   else if (msgType == "Buzz") {
     // Activate buzzer
-    Serial.println("🔊 Buzz message received - activating buzzer");
+    unsigned long buzzDuration = 500; // default
+    if (msgData.length() > 0 && msgData != "null") {
+      buzzDuration = msgData.toInt();
+    }
+    Serial.println("🔊 Buzz message received - activating buzzer for " + String(buzzDuration) + "ms");
     digitalWrite(BUZZER_PIN, HIGH);
-    delay(500); // Buzz for 0.5 second
+    delay(buzzDuration);
     digitalWrite(BUZZER_PIN, LOW);
     Serial.println("✅ Buzzer deactivated");
   }
@@ -1092,7 +1152,7 @@ void handleDiagnostics() {
   html += "<div class='info'><span class='label'>Auth Status:</span> <span class='value'>" + String(checkWebAuth() ? "✅ Authenticated" : "❌ Not Authenticated") + "</span></div>";
   
   html += "<div class='info'><span class='label'>MQTT Status:</span> <span class='value'>" + String(mqttClient.connected() ? "✅ Connected" : "❌ Disconnected") + "</span></div>";
-  html += "<div class='info'><span class='label'>API Base URL:</span> <span class='value'>" + String(BACKEND_BASE_URL) + "</span></div>";
+  html += "<div class='info'><span class='label'>API Base URL:</span> <span class='value'>" + backendBaseUrl + "</span></div>";
   html += "<div class='info'><span class='label'>Sensor Endpoint:</span> <span class='value'>" + String(SENSOR_POST_ENDPOINT) + "</span></div>";
   html += "<div class='info'><span class='label'>Sensor Interval:</span> <span class='value'>" + String(sensorInterval) + " ms</span></div>";
   
@@ -1283,7 +1343,7 @@ void handleConfigPage() {
   
   b += "<div class='form-group'>";
   b += "<label>📱 Device ID (Read-only)</label>";
-  b += "<input name='device_id' value='" + device_id + "' readonly title='Device ID cannot be changed'>";
+  b += "<input name='device_id' type='text' value='" + device_id + "' readonly title='Device ID cannot be changed'>";
   b += "</div>";
   
   b += "<div class='form-group'>";
@@ -1293,7 +1353,7 @@ void handleConfigPage() {
   
   b += "<div class='form-group'>";
   b += "<label>👤 Web Username</label>";
-  b += "<input name='webUser' value='" + webUsername + "' required>";
+  b += "<input name='webUser' type='text' value='" + webUsername + "' required>";
   b += "</div>";
   
   b += "<div class='form-group'>";
@@ -1304,6 +1364,11 @@ void handleConfigPage() {
   b += "<div class='form-group'>";
   b += "<label>⏱️ Sensor Interval (milliseconds)</label>";
   b += "<input name='sensInt' type='number' value='" + String(sensorInterval) + "' min='1000' max='300000' required>";
+  b += "</div>";
+  
+  b += "<div class='form-group'>";
+  b += "<label>🌐 Backend Base URL</label>";
+  b += "<input name='backendUrl' type='text' value='" + backendBaseUrl + "' required>";
   b += "</div>";
   
   b += "<input type='submit' value='💾 Save Configuration' style='width:100%;padding:15px;font-size:16px;margin-top:10px;'>";
@@ -1325,6 +1390,7 @@ void handleConfigSave() {
   if (server.hasArg("webUser")) webUsername = server.arg("webUser");
   if (server.hasArg("webPass")) webPassword = server.arg("webPass");
   if (server.hasArg("sensInt")) sensorInterval = server.arg("sensInt").toInt();
+  if (server.hasArg("backendUrl")) backendBaseUrl = server.arg("backendUrl");
   
   // Clear cached JWT when secret key changes
   cachedJWT = "";
@@ -1712,7 +1778,8 @@ void loop() {
   // Periodic sensor read & send batch to API
   if (millis() - lastSensorMillis >= sensorInterval) {
     lastSensorMillis = millis();
-    Serial.println("[" + getTimestamp() + "] Reading sensors...");
+    const String logPrefix = "[" + getTimestamp() + "] ";
+    Serial.println(logPrefix + "Reading sensors...");
 
     // Read all sensors
     float t = dht.readTemperature();
@@ -1720,32 +1787,30 @@ void loop() {
     ds18b20.requestTemperatures();
     float t2 = ds18b20.getTempCByIndex(0);
 
-    // Validate readings and send as batch if all are valid
-    bool dhtTempValid = !isnan(t);
-    bool dhtHumValid = !isnan(h);
-    bool ds18TempValid = (t2 != DEVICE_DISCONNECTED_C);
+    const bool dhtTempValid = !isnan(t);
+    const bool dhtHumValid = !isnan(h);
+    const bool ds18TempValid = (t2 != DEVICE_DISCONNECTED_C);
 
-    if (dhtTempValid && dhtHumValid && ds18TempValid) {
-      // Send all readings as a batch
-      sendSensorReadingsBatch(t, h, t2);
-      Serial.println("[" + getTimestamp() + "] ✅ Sensor readings batch sent successfully");
+    const float sensorValues[] = {t, h, t2};
+    const bool validityFlags[] = {dhtTempValid, dhtHumValid, ds18TempValid};
+
+    bool allValid = true;
+    for (bool flag : validityFlags) {
+      allValid &= flag;
+    }
+
+    if (allValid) {
+      if (sendSensorReadingsBatch(t, h, t2)) {
+        Serial.println(logPrefix + "✅ Sensor readings batch sent successfully");
+      }
     } else {
-      Serial.println("[" + getTimestamp() + "] ⚠️ Some sensor readings invalid - skipping batch send");
-      if (!dhtTempValid) Serial.println("[" + getTimestamp() + "]   DHT11 Temperature: INVALID");
-      if (!dhtHumValid) Serial.println("[" + getTimestamp() + "]   DHT11 Humidity: INVALID");
-      if (!ds18TempValid) Serial.println("[" + getTimestamp() + "]   DS18B20 Temperature: INVALID");
+      Serial.println(logPrefix + "⚠️ Some sensor readings invalid - skipping batch send");
+      logSensorReadings(logPrefix, sensorValues, validityFlags, SENSOR_COUNT);
     }
 
-    // Log individual readings for debugging
-    if (dhtTempValid) {
-      Serial.println("[" + getTimestamp() + "] DHT11_Temperature: " + String(t, 2) + " °C");
-    }
-    if (dhtHumValid) {
-      Serial.println("[" + getTimestamp() + "] DHT11_Humidity: " + String(h, 1) + " %");
-    }
     if (ds18TempValid) {
-      float tempF = ds18b20.toFahrenheit(t2);
-      Serial.println("[" + getTimestamp() + "] DS18B20 Temperature: " + String(t2, 2) + " °C / " + String(tempF, 2) + " °F");
+      const float tempF = ds18b20.toFahrenheit(t2);
+      Serial.println(logPrefix + "DS18B20 Temperature (°F): " + String(tempF, 2));
     }
   }
 
