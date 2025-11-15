@@ -97,7 +97,7 @@
 #define SENSOR_DHT11_TEMP "dht11-temperature"
 #define SENSOR_DHT11_HUMIDITY "dht11-humidity"
 #define SENSOR_DS18B20_TEMP "ds18b20-temperature"
-#define BACKEND_BASE_URL "https://iot.orbiqlabs.com" // IoT Device API base URL
+#define BACKEND_BASE_URL "https://151a2614ac38.ngrok-free.app" // IoT Device API base URL
 #define SENSOR_POST_ENDPOINT "/api-iot/device/sensor-readings"
 #define GET_STATUS_ENDPOINT "/api-iot/device/status"
 #define POST_STATUS_ENDPOINT "/api-iot/device/status"
@@ -348,6 +348,41 @@ String getValidJWT() {
   return cachedJWT;
 }
 
+// Helper function to create configured HTTPClient
+HTTPClient* createConfiguredHTTPClient(const String& endpoint, const String& contentType = "application/json") {
+  HTTPClient* http = new HTTPClient();
+  String url = String(BACKEND_BASE_URL) + endpoint;
+  http->begin(url);
+  http->addHeader("X-ESP32-Device-Id", device_id);
+  http->addHeader("X-IOT-Token", getValidJWT());
+  if (contentType.length() > 0) {
+    http->addHeader("Content-Type", contentType);
+  }
+  return http;
+}
+
+// Helper function to handle API error responses
+void handleAPIError(int code) {
+  if (code == 400) {
+    Serial.println("[" + getTimestamp() + "] ❌ 400 Bad Request - Possible causes:");
+    Serial.println("[" + getTimestamp() + "]   1. Device '" + device_id + "' may not be registered in backend");
+    Serial.println("[" + getTimestamp() + "]   2. JWT token may be invalid or expired");
+    Serial.println("[" + getTimestamp() + "]   3. Status format may be incorrect (expected: string of 1-8 digits)");
+    Serial.println("[" + getTimestamp() + "]   4. API endpoint may require different authentication");
+    Serial.println("[" + getTimestamp() + "]   5. Backend server may be down or ngrok tunnel inactive");
+  } else if (code == 401) {
+    Serial.println("[" + getTimestamp() + "] ❌ 401 Unauthorized - JWT token is invalid");
+    // Clear cached JWT to force regeneration
+    cachedJWT = "";
+    jwtGeneratedAt = 0;
+    Serial.println("[" + getTimestamp() + "] Cleared cached JWT - will regenerate on next attempt");
+  } else if (code == 404) {
+    Serial.println("[" + getTimestamp() + "] ❌ 404 Not Found - Device not registered or wrong endpoint");
+  } else {
+    Serial.println("[" + getTimestamp() + "] ❌ HTTP response code: " + String(code));
+  }
+}
+
 String headerBasicAuthEncoded(const String &user, const String &pass) {
   // not using Basic, but helper if needed
   return "";
@@ -394,15 +429,18 @@ void resetWifiSettings() {
   ESP.restart();
 }
 
-// Send sensor reading immediately to API
-bool sendSensorReading(const String &sensorId, float value, const String &unit) {
-  HTTPClient http;
-  String url = String(BACKEND_BASE_URL) + SENSOR_POST_ENDPOINT;
+// Helper function to add a sensor reading to the batch JSON array
+void addSensorReadingToBatch(JsonArray& readingsArray, const String& sensorId, float value, const String& unit, const String& timestamp) {
+  JsonObject readingObj = readingsArray.createNestedObject();
+  readingObj["sensorIdentifier"] = sensorId;
+  readingObj["numericValue"] = value;
+  readingObj["textValue"] = String(value, unit == "%" ? 1 : 2) + " " + unit;
+  readingObj["capturedOnUtc"] = timestamp;
+}
 
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-ESP32-Device-Id", device_id);
-  http.addHeader("X-IOT-Token", getValidJWT());
+// Send sensor readings as a batch (all sensors together)
+bool sendSensorReadingsBatch(float dhtTemp, float dhtHumidity, float ds18Temp) {
+  HTTPClient* http = createConfiguredHTTPClient(SENSOR_POST_ENDPOINT);
 
   // Get current UTC time
   struct tm timeinfo;
@@ -413,48 +451,54 @@ bool sendSensorReading(const String &sensorId, float value, const String &unit) 
     strcpy(timestamp, "2024-01-01T00:00:00Z");
   }
 
-  // Create JSON payload for single reading
-  StaticJsonDocument<256> doc;
+  // Create JSON payload for batch of readings
+  StaticJsonDocument<512> doc;
   JsonArray readingsArray = doc.to<JsonArray>();
-  JsonObject readingObj = readingsArray.createNestedObject();
-  readingObj["sensorIdentifier"] = sensorId;
-  readingObj["numericValue"] = value;
-  readingObj["textValue"] = String(value, 2) + " " + unit;
-  readingObj["capturedOnUtc"] = timestamp;
+
+  // Add all sensor readings using the helper function
+  addSensorReadingToBatch(readingsArray, SENSOR_DHT11_TEMP, dhtTemp, "°C", timestamp);
+  addSensorReadingToBatch(readingsArray, SENSOR_DHT11_HUMIDITY, dhtHumidity, "%", timestamp);
+  addSensorReadingToBatch(readingsArray, SENSOR_DS18B20_TEMP, ds18Temp, "°C", timestamp);
 
   String payload;
   serializeJson(doc, payload);
 
-  int code = http.POST(payload);
+  Serial.println("[" + getTimestamp() + "] Sending sensor readings batch:");
+  Serial.println("[" + getTimestamp() + "]   DHT11 Temp: " + String(dhtTemp, 2) + " °C");
+  Serial.println("[" + getTimestamp() + "]   DHT11 Humidity: " + String(dhtHumidity, 1) + " %");
+  Serial.println("[" + getTimestamp() + "]   DS18B20 Temp: " + String(ds18Temp, 2) + " °C");
+
+  int code = http->POST(payload);
   if (code > 0) {
-    String resp = http.getString();
-    Serial.println("[" + getTimestamp() + "] Sensor data response (" + String(code) + "): " + resp);
-    http.end();
+    String resp = http->getString();
+    Serial.println("[" + getTimestamp() + "] Sensor batch response (" + String(code) + "): " + resp);
+
+    // Handle errors
+    if (!(code >= 200 && code < 300)) {
+      handleAPIError(code);
+    }
+
+    http->end();
+    delete http;
     return (code >= 200 && code < 300);
   } else {
-    Serial.println("[" + getTimestamp() + "] Sensor data send failed, error: " + http.errorToString(code));
-    http.end();
+    Serial.println("[" + getTimestamp() + "] Sensor batch send failed, error: " + http->errorToString(code));
+    http->end();
+    delete http;
     return false;
   }
-}
-
-// ---------- IoT Device API Functions ----------
+}// ---------- IoT Device API Functions ----------
 
 DeviceStatus getDeviceStatus() {
-  HTTPClient http;
-  String url = String(BACKEND_BASE_URL) + GET_STATUS_ENDPOINT;
+  HTTPClient* http = createConfiguredHTTPClient(GET_STATUS_ENDPOINT, "");
 
-  Serial.println("[" + getTimestamp() + "] Getting device status from: " + url);
+  Serial.println("[" + getTimestamp() + "] Getting device status from: " + String(BACKEND_BASE_URL) + GET_STATUS_ENDPOINT);
 
-  http.begin(url);
-  http.addHeader("X-ESP32-Device-Id", device_id);
-  http.addHeader("X-IOT-Token", getValidJWT());
-
-  int code = http.GET();
+  int code = http->GET();
   DeviceStatus result = {"", false}; // Default values
   
   if (code > 0) {
-    String resp = http.getString();
+    String resp = http->getString();
     Serial.println("[" + getTimestamp() + "] Get Status response (" + String(code) + "): " + resp);
 
     if (code == 200) {
@@ -466,33 +510,29 @@ DeviceStatus getDeviceStatus() {
         result.status = doc["status"].as<String>();
         result.online = doc["online"].as<bool>();
         result.success = true;
-        http.end();
+        http->end();
+        delete http;
         return result;
       } else {
         Serial.println("[" + getTimestamp() + "] JSON parsing error: " + String(error.c_str()));
       }
-    } else if (code == 404 || code == 401) {
-      Serial.println("[" + getTimestamp() + "] ❌ Device not found or unauthorized. Code: " + String(code));
+    } else {
+      handleAPIError(code);
     }
   } else {
-    Serial.println("[" + getTimestamp() + "] Get Status failed, error: " + http.errorToString(code));
+    Serial.println("[" + getTimestamp() + "] Get Status failed, error: " + http->errorToString(code));
   }
-  http.end();
+  http->end();
+  delete http;
   return result;
 }
 
 bool submitDeviceStatus(const String &statusString) {
-  HTTPClient http;
-  String url = String(BACKEND_BASE_URL) + POST_STATUS_ENDPOINT;
+  HTTPClient* http = createConfiguredHTTPClient(POST_STATUS_ENDPOINT);
 
-  Serial.println("[" + getTimestamp() + "] Submitting device status to: " + url + " Device ID: " + device_id);
-
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-ESP32-Device-Id", device_id);
+  Serial.println("[" + getTimestamp() + "] Submitting device status to: " + String(BACKEND_BASE_URL) + POST_STATUS_ENDPOINT + " Device ID: " + device_id);
 
   String jwt = getValidJWT();
-  http.addHeader("X-IOT-Token", jwt);
   Serial.println("[" + getTimestamp() + "] JWT Token length: " + String(jwt.length()));
 
 
@@ -518,64 +558,49 @@ bool submitDeviceStatus(const String &statusString) {
   Serial.println("[" + getTimestamp() + "] Status string length: " + String(statusString.length()));
   Serial.println("[" + getTimestamp() + "] Status string content: '" + statusString + "'");
 
-  int code = http.POST(payload);
+  int code = http->POST(payload);
   if (code > 0) {
-    String resp = http.getString();
+    String resp = http->getString();
     Serial.println("[" + getTimestamp() + "] Submit Status response (" + String(code) + "): " + resp);
 
-    if (code == 400) {
-      Serial.println("[" + getTimestamp() + "] ❌ 400 Bad Request - Possible causes:");
-      Serial.println("[" + getTimestamp() + "]   1. Device '" + device_id + "' may not be registered in backend");
-      Serial.println("[" + getTimestamp() + "]   2. JWT token may be invalid or expired");
-      Serial.println("[" + getTimestamp() + "]   3. Status format may be incorrect (expected: string of 1-8 digits)");
-      Serial.println("[" + getTimestamp() + "]   4. API endpoint may require different authentication");
-
-      // Try to get device status to check if device exists
-      Serial.println("[" + getTimestamp() + "] Checking if device exists in backend...");
-      DeviceStatus devStatus = getDeviceStatus();
-      if (devStatus.success) {
-        Serial.println("[" + getTimestamp() + "] ✅ Device exists in backend (status: " + devStatus.status + ", online: " + String(devStatus.online) + ")");
-      } else {
-        Serial.println("[" + getTimestamp() + "] ❌ Device NOT found in backend or authentication failed");
-      }
-    } else if (code == 401) {
-      Serial.println("[" + getTimestamp() + "] ❌ 401 Unauthorized - JWT token is invalid");
-      // Clear cached JWT to force regeneration
-      cachedJWT = "";
-      jwtGeneratedAt = 0;
-      Serial.println("[" + getTimestamp() + "] Cleared cached JWT - will regenerate on next attempt");
-    } else if (code == 404) {
-      Serial.println("[" + getTimestamp() + "] ❌ 404 Not Found - Device not registered or wrong endpoint");
+    // Handle errors
+    if (!(code >= 200 && code < 300)) {
+      handleAPIError(code);
     }
 
-    http.end();
+    http->end();
+    delete http;
     return (code >= 200 && code < 300);
   } else {
-    Serial.println("[" + getTimestamp() + "] Submit Status failed, error: " + http.errorToString(code));
-    http.end();
+    Serial.println("[" + getTimestamp() + "] Submit Status failed, error: " + http->errorToString(code));
+    http->end();
+    delete http;
     return false;
   }
 }
 
 bool pingDevice() {
-  HTTPClient http;
-  String url = String(BACKEND_BASE_URL) + PING_ENDPOINT;
+  HTTPClient* http = createConfiguredHTTPClient(PING_ENDPOINT);
 
-  Serial.println("[" + getTimestamp() + "] Pinging device to: " + url);
+  Serial.println("[" + getTimestamp() + "] Pinging device to: " + String(BACKEND_BASE_URL) + PING_ENDPOINT);
 
-  http.begin(url);
-  http.addHeader("X-ESP32-Device-Id", device_id);
-  http.addHeader("X-IOT-Token", getValidJWT());
-
-  int code = http.POST("");
+  int code = http->POST("");
   if (code > 0) {
-    String resp = http.getString();
+    String resp = http->getString();
     Serial.println("[" + getTimestamp() + "] Ping response (" + String(code) + "): " + resp);
-    http.end();
+    
+    // Handle errors
+    if (!(code >= 200 && code < 300)) {
+      handleAPIError(code);
+    }
+    
+    http->end();
+    delete http;
     return (code >= 200 && code < 300);
   } else {
-    Serial.println("[" + getTimestamp() + "] Ping failed, error: " + http.errorToString(code));
-    http.end();
+    Serial.println("[" + getTimestamp() + "] Ping failed, error: " + http->errorToString(code));
+    http->end();
+    delete http;
     return false;
   }
 }
@@ -778,7 +803,7 @@ void connectToMQTT() {
       
       // Sync relay state from backend after MQTT reconnection
       Serial.println("🔄 Syncing relay states from backend after MQTT reconnection...");
-      fetchRelayStateFromBackend();
+      initializeRelayStateWithRetry();
     } else {
       Serial.println("❌ Failed to subscribe to: " + topic);
       Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -836,6 +861,52 @@ bool fetchRelayStateFromBackend() {
   }
   
   return false;
+}
+
+// Initialize relay state with retry logic - try to get status, if fails wait 1 min while showing LCD data, then retry up to MAX_RETRIES times
+void initializeRelayStateWithRetry() {
+  const int MAX_RETRIES = 3; // Maximum number of retry attempts
+  int retryCount = 0;
+
+  Serial.println("🔄 Attempting to sync relay states from backend...");
+
+  while (retryCount < MAX_RETRIES) {
+    // Try to fetch relay state
+    if (fetchRelayStateFromBackend()) {
+      Serial.println("✅ Relay states initialized successfully");
+      return; // Success, no need to retry
+    }
+
+    retryCount++;
+    Serial.println("❌ Backend sync failed (attempt " + String(retryCount) + "/" + String(MAX_RETRIES) + ")");
+
+    if (retryCount < MAX_RETRIES) {
+      // Wait 1 minute while cycling LCD before next retry
+      Serial.println("⏳ Waiting 1 minute before retry...");
+      Serial.println("📺 Showing regular LCD data during wait period");
+
+      unsigned long waitStart = millis();
+      unsigned long waitDuration = 60000; // 1 minute
+
+      while (millis() - waitStart < waitDuration) {
+        // Cycle LCD to show regular data during wait
+        cycleLCD();
+
+        // Handle other tasks that might be needed
+        server.handleClient();
+        handleButtons();
+
+        // Small delay to prevent overwhelming the system
+        delay(100);
+      }
+
+      Serial.println("⏰ 1 minute wait completed - retrying backend sync...");
+    }
+  }
+
+  // All retries exhausted
+  Serial.println("❌ All " + String(MAX_RETRIES) + " retry attempts failed - relays remain in default OFF state");
+  Serial.println("💡 Device will continue operating with relays OFF. Check backend connectivity and try again later.");
 }
 
 bool postRelayUpdateToBackend(int index, int val) {
@@ -1415,9 +1486,9 @@ void setup() {
   // Connect to MQTT broker
   connectToMQTT();
 
-  // Sync relay states from backend on startup
+  // Initialize relay states from backend with retry logic
   Serial.println("🔄 Initial relay state sync from backend...");
-  fetchRelayStateFromBackend();
+  initializeRelayStateWithRetry();
 
   // ensure we have credentials persisted
   savePrefs();
@@ -1614,7 +1685,7 @@ void loop() {
   if (!wasWiFiConnected && isWiFiConnected) {
     Serial.println("📶 WiFi reconnected! SSID: " + WiFi.SSID() + "   IP: " + WiFi.localIP().toString() + "⏰ Reconfiguring NTP time synchronization...");
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-    fetchRelayStateFromBackend();
+    initializeRelayStateWithRetry();
   }
   wasWiFiConnected = isWiFiConnected;
 
@@ -1638,27 +1709,41 @@ void loop() {
   // LED wifi indicator
   if (WiFi.status() == WL_CONNECTED) digitalWrite(LED_WIFI_PIN, HIGH); else digitalWrite(LED_WIFI_PIN, LOW);
 
-  // Periodic sensor read & save to file
+  // Periodic sensor read & send batch to API
   if (millis() - lastSensorMillis >= sensorInterval) {
     lastSensorMillis = millis();
     Serial.println("[" + getTimestamp() + "] Reading sensors...");
+
+    // Read all sensors
     float t = dht.readTemperature();
     float h = dht.readHumidity();
     ds18b20.requestTemperatures();
     float t2 = ds18b20.getTempCByIndex(0);
 
-    // Validate readings (DHT can sometimes return NAN)
-    if (!isnan(t)){
-      sendSensorReading(SENSOR_DHT11_TEMP, t, "°C");
+    // Validate readings and send as batch if all are valid
+    bool dhtTempValid = !isnan(t);
+    bool dhtHumValid = !isnan(h);
+    bool ds18TempValid = (t2 != DEVICE_DISCONNECTED_C);
+
+    if (dhtTempValid && dhtHumValid && ds18TempValid) {
+      // Send all readings as a batch
+      sendSensorReadingsBatch(t, h, t2);
+      Serial.println("[" + getTimestamp() + "] ✅ Sensor readings batch sent successfully");
+    } else {
+      Serial.println("[" + getTimestamp() + "] ⚠️ Some sensor readings invalid - skipping batch send");
+      if (!dhtTempValid) Serial.println("[" + getTimestamp() + "]   DHT11 Temperature: INVALID");
+      if (!dhtHumValid) Serial.println("[" + getTimestamp() + "]   DHT11 Humidity: INVALID");
+      if (!ds18TempValid) Serial.println("[" + getTimestamp() + "]   DS18B20 Temperature: INVALID");
+    }
+
+    // Log individual readings for debugging
+    if (dhtTempValid) {
       Serial.println("[" + getTimestamp() + "] DHT11_Temperature: " + String(t, 2) + " °C");
-    } 
-    if (!isnan(h)) {  
-      sendSensorReading(SENSOR_DHT11_HUMIDITY, h, "%");
+    }
+    if (dhtHumValid) {
       Serial.println("[" + getTimestamp() + "] DHT11_Humidity: " + String(h, 1) + " %");
     }
-    if (t2 != DEVICE_DISCONNECTED_C)
-    {
-      sendSensorReading(SENSOR_DS18B20_TEMP, t2, "°C");
+    if (ds18TempValid) {
       float tempF = ds18b20.toFahrenheit(t2);
       Serial.println("[" + getTimestamp() + "] DS18B20 Temperature: " + String(t2, 2) + " °C / " + String(tempF, 2) + " °F");
     }
