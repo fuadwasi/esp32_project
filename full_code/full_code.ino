@@ -1523,7 +1523,7 @@ void setup() {
     
     unsigned long sensorInitStart = millis();
     
-    while (millis() - sensorInitStart < 30000) { // 30 seconds
+    while (millis() - sensorInitStart < 10000) { // 10 seconds
       // Read sensors
       float t = dht.readTemperature();
       float h = dht.readHumidity();
